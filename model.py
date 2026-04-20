@@ -1,13 +1,12 @@
 """
-Improved Fusion Models for Aircraft Trajectory Reconstruction
+Trajectory gap-filling models for aircraft reconstruction.
 
-Implements three approaches beyond the baseline:
-1. Constant-Velocity Kalman Filter - Physics-based state estimation
-2. Kalman Smoother - Bidirectional filtering for better reconstruction
-3. LSTM Sequence Model - Machine learning approach for complex patterns
+The project model is a bidirectional LSTM gap-filler trained on held-out
+trajectory windows. Kalman filter/smoother classes are kept as optional
+physics-based comparison methods.
 
-These models reconstruct missing trajectory segments better than naive great-circle
-interpolation by accounting for velocity dynamics and temporal patterns.
+The LSTM learns a residual correction on top of an interpolation baseline so
+it only has to learn where simple interpolation is wrong.
 """
 
 import numpy as np
@@ -27,6 +26,19 @@ try:
     TENSORFLOW_AVAILABLE = True
 except ImportError:
     TENSORFLOW_AVAILABLE = False
+
+
+def great_circle_km(lat1, lon1, lat2, lon2):
+    """Vectorized great-circle distance in kilometers."""
+    radius_km = 6371.0
+    lat1, lon1, lat2, lon2 = map(np.radians, [lat1, lon1, lat2, lon2])
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+    a = (
+        np.sin(dlat / 2) ** 2
+        + np.cos(lat1) * np.cos(lat2) * np.sin(dlon / 2) ** 2
+    )
+    return radius_km * 2 * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
 
 
 @dataclass
@@ -245,10 +257,15 @@ class KalmanSmoother:
         return (states_smooth[:, 0], states_smooth[:, 1], states_smooth[:, 2])
 
 
-def create_lstm_model(sequence_length: int = 20, output_length: int = 5,
+POSITION_SCALE = 10.0
+ALTITUDE_SCALE_METERS = 10000.0
+TIME_SCALE_SECONDS = 3600.0
+
+
+def create_lstm_model(sequence_length: int = 40, output_length: int = 10,
                       feature_dim: int = 4) -> 'keras.Model':
     """
-    Create LSTM sequence model for trajectory prediction.
+    Create a bidirectional LSTM sequence model for trajectory gap filling.
     
     Architecture:
     • Input: Sequences of past positions/velocities
@@ -256,8 +273,8 @@ def create_lstm_model(sequence_length: int = 20, output_length: int = 5,
     • Dense output: Predict future positions
     
     Args:
-        sequence_length: Number of past timesteps
-        output_length: Number of future timesteps to predict
+        sequence_length: Number of context timesteps
+        output_length: Number of gap timesteps to reconstruct
         feature_dim: Number of features (lat, lon, alt, time_delta)
     
     Returns:
@@ -267,111 +284,302 @@ def create_lstm_model(sequence_length: int = 20, output_length: int = 5,
         raise ImportError("TensorFlow not available. Install with: pip install tensorflow")
     
     model = keras.Sequential([
-        layers.LSTM(64, return_sequences=True, 
-                   input_shape=(sequence_length, feature_dim)),
+        layers.Input(shape=(sequence_length, feature_dim)),
+        layers.Bidirectional(layers.LSTM(64, return_sequences=True)),
         layers.Dropout(0.2),
-        layers.LSTM(32, return_sequences=False),
+        layers.Bidirectional(layers.LSTM(32, return_sequences=False)),
         layers.Dropout(0.2),
         layers.Dense(64, activation='relu'),
-        layers.Dense(output_length * 3),  # Predict lat, lon, alt for each future step
+        layers.Dense(
+            output_length * 3,
+            kernel_initializer="zeros",
+            bias_initializer="zeros",
+        ),
         layers.Reshape((output_length, 3))
     ])
     
-    model.compile(optimizer='adam', loss='mse', metrics=['mae'])
+    model.compile(optimizer='adam', loss=keras.losses.Huber(delta=1.0), metrics=['mae'])
     return model
 
 
 class LSTMTrajectoryModel:
     """LSTM-based trajectory reconstruction model."""
-    
-    def __init__(self, sequence_length: int = 20):
+
+    def __init__(self, context_length: int = 20, gap_length: int = 5,
+                 sequence_length: Optional[int] = None):
         if not TENSORFLOW_AVAILABLE:
             raise ImportError("TensorFlow not available for LSTM model")
-        
-        self.sequence_length = sequence_length
-        self.model = create_lstm_model(sequence_length)
+
+        if sequence_length is not None:
+            context_length = sequence_length
+
+        self.context_length = int(context_length)
+        self.gap_length = int(gap_length)
+        self.sequence_length = self.context_length * 2
+        self.feature_dim = 4
+        self.model = create_lstm_model(
+            sequence_length=self.sequence_length,
+            output_length=self.gap_length,
+            feature_dim=self.feature_dim,
+        )
         self.fitted = False
-    
+
+    @staticmethod
+    def _safe_time_delta(current: float, previous: float) -> float:
+        delta = float(current) - float(previous)
+        return delta if np.isfinite(delta) else 0.0
+
+    def _build_context_features(
+        self,
+        before_positions: np.ndarray,
+        before_altitudes: np.ndarray,
+        before_times: np.ndarray,
+        after_positions: np.ndarray,
+        after_altitudes: np.ndarray,
+        after_times: np.ndarray,
+    ) -> Tuple[np.ndarray, Tuple[float, float, float]]:
+        before_positions = np.asarray(before_positions, dtype=np.float64)[-self.context_length:]
+        before_altitudes = np.asarray(before_altitudes, dtype=np.float64)[-self.context_length:]
+        before_times = np.asarray(before_times, dtype=np.float64)[-self.context_length:]
+        after_positions = np.asarray(after_positions, dtype=np.float64)[:self.context_length]
+        after_altitudes = np.asarray(after_altitudes, dtype=np.float64)[:self.context_length]
+        after_times = np.asarray(after_times, dtype=np.float64)[:self.context_length]
+
+        if len(before_positions) != self.context_length or len(after_positions) != self.context_length:
+            raise ValueError(
+                f"Expected {self.context_length} points before and after the gap"
+            )
+
+        anchor_lat = float(before_positions[-1, 0])
+        anchor_lon = float(before_positions[-1, 1])
+        anchor_alt = float(before_altitudes[-1])
+        anchor_time = float(before_times[-1])
+
+        features = []
+        for i, (position, altitude, timestamp) in enumerate(
+            zip(before_positions, before_altitudes, before_times)
+        ):
+            dt = 0.0 if i == 0 else self._safe_time_delta(timestamp, before_times[i - 1])
+            features.append([
+                (float(position[0]) - anchor_lat) * POSITION_SCALE,
+                (float(position[1]) - anchor_lon) * POSITION_SCALE,
+                (float(altitude) - anchor_alt) / ALTITUDE_SCALE_METERS,
+                dt / TIME_SCALE_SECONDS,
+            ])
+
+        for i, (position, altitude, timestamp) in enumerate(
+            zip(after_positions, after_altitudes, after_times)
+        ):
+            previous_time = anchor_time if i == 0 else after_times[i - 1]
+            dt = self._safe_time_delta(timestamp, previous_time)
+            features.append([
+                (float(position[0]) - anchor_lat) * POSITION_SCALE,
+                (float(position[1]) - anchor_lon) * POSITION_SCALE,
+                (float(altitude) - anchor_alt) / ALTITUDE_SCALE_METERS,
+                dt / TIME_SCALE_SECONDS,
+            ])
+
+        return np.asarray(features, dtype=np.float32), (anchor_lat, anchor_lon, anchor_alt)
+
+    @staticmethod
+    def _linear_gap_baseline(
+        before_positions: np.ndarray,
+        before_altitudes: np.ndarray,
+        after_positions: np.ndarray,
+        after_altitudes: np.ndarray,
+        gap_length: int,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        p_before = np.asarray(before_positions, dtype=np.float64)[-1]
+        p_after = np.asarray(after_positions, dtype=np.float64)[0]
+        alt_before = float(np.asarray(before_altitudes, dtype=np.float64)[-1])
+        alt_after = float(np.asarray(after_altitudes, dtype=np.float64)[0])
+
+        fractions = np.linspace(
+            1 / (gap_length + 1),
+            gap_length / (gap_length + 1),
+            gap_length,
+            dtype=np.float64,
+        )
+        baseline_positions = p_before + (p_after - p_before) * fractions[:, np.newaxis]
+        baseline_altitudes = alt_before + (alt_after - alt_before) * fractions
+        return baseline_positions, baseline_altitudes
+
+    @staticmethod
+    def _build_residual_target(
+        gap_positions: np.ndarray,
+        gap_altitudes: np.ndarray,
+        baseline_positions: np.ndarray,
+        baseline_altitudes: np.ndarray,
+    ) -> np.ndarray:
+        gap_positions = np.asarray(gap_positions, dtype=np.float64)
+        gap_altitudes = np.asarray(gap_altitudes, dtype=np.float64)
+        baseline_positions = np.asarray(baseline_positions, dtype=np.float64)
+        baseline_altitudes = np.asarray(baseline_altitudes, dtype=np.float64)
+
+        return np.column_stack([
+            (gap_positions[:, 0] - baseline_positions[:, 0]) * POSITION_SCALE,
+            (gap_positions[:, 1] - baseline_positions[:, 1]) * POSITION_SCALE,
+            (gap_altitudes - baseline_altitudes) / ALTITUDE_SCALE_METERS,
+        ]).astype(np.float32)
+
     def prepare_training_data(self, trajectories: List[Tuple[np.ndarray, np.ndarray, np.ndarray]],
-                             output_length: int = 5) -> Tuple[np.ndarray, np.ndarray]:
+                             output_length: Optional[int] = None) -> Tuple[np.ndarray, np.ndarray]:
         """
         Prepare training data for LSTM.
-        
+
         Args:
             trajectories: List of (positions, altitudes, times) tuples
-            output_length: How many steps to predict
-        
+            output_length: Optional compatibility parameter; must match gap_length
+
         Returns:
             (X_train, y_train) ready for model training
         """
+        if output_length is not None and output_length != self.gap_length:
+            raise ValueError("output_length must match the model gap_length")
+
         X, y = [], []
-        
+        window_length = 2 * self.context_length + self.gap_length
+
         for positions, altitudes, times in trajectories:
-            if len(positions) < self.sequence_length + output_length:
+            if len(positions) < window_length:
                 continue
-            
-            for i in range(len(positions) - self.sequence_length - output_length):
-                # Input: past sequence
-                seq_in = []
-                for j in range(self.sequence_length):
-                    idx = i + j
-                    seq_in.append([
-                        positions[idx, 0],  # lat
-                        positions[idx, 1],  # lon
-                        altitudes[idx],
-                        times[idx + 1] - times[idx] if idx < len(times) - 1 else 0
-                    ])
-                
-                # Output: future sequence
-                seq_out = []
-                for j in range(output_length):
-                    idx = i + self.sequence_length + j
-                    seq_out.append([
-                        positions[idx, 0],  # lat
-                        positions[idx, 1],  # lon
-                        altitudes[idx]
-                    ])
-                
-                X.append(seq_in)
-                y.append(seq_out)
-        
-        return np.array(X), np.array(y)
-    
-    def train(self, X_train: np.ndarray, y_train: np.ndarray, 
-             epochs: int = 50, batch_size: int = 32, verbose: int = 0):
+
+            for start in range(len(positions) - window_length + 1):
+                before_slc = slice(start, start + self.context_length)
+                gap_slc = slice(
+                    start + self.context_length,
+                    start + self.context_length + self.gap_length,
+                )
+                after_slc = slice(
+                    start + self.context_length + self.gap_length,
+                    start + window_length,
+                )
+
+                features, _ = self._build_context_features(
+                    positions[before_slc], altitudes[before_slc], times[before_slc],
+                    positions[after_slc], altitudes[after_slc], times[after_slc],
+                )
+                baseline_positions, baseline_altitudes = self._linear_gap_baseline(
+                    positions[before_slc], altitudes[before_slc],
+                    positions[after_slc], altitudes[after_slc],
+                    self.gap_length,
+                )
+                target = self._build_residual_target(
+                    positions[gap_slc],
+                    altitudes[gap_slc],
+                    baseline_positions,
+                    baseline_altitudes,
+                )
+
+                X.append(features)
+                y.append(target)
+
+        if not X:
+            return (
+                np.empty((0, self.sequence_length, self.feature_dim), dtype=np.float32),
+                np.empty((0, self.gap_length, 3), dtype=np.float32),
+            )
+
+        return np.asarray(X, dtype=np.float32), np.asarray(y, dtype=np.float32)
+
+    def train(self, X_train: np.ndarray, y_train: np.ndarray,
+             epochs: int = 50, batch_size: int = 32, verbose: int = 0,
+             validation_data: Optional[Tuple[np.ndarray, np.ndarray]] = None,
+             callbacks: Optional[List['keras.callbacks.Callback']] = None,
+             validation_split: float = 0.2):
         """Train the LSTM model."""
-        self.model.fit(X_train, y_train, epochs=epochs, batch_size=batch_size, 
-                      verbose=verbose, validation_split=0.2)
+        fit_kwargs = {}
+        if validation_data is not None:
+            fit_kwargs["validation_data"] = validation_data
+        else:
+            fit_kwargs["validation_split"] = validation_split
+        if callbacks is not None:
+            fit_kwargs["callbacks"] = callbacks
+
+        history = self.model.fit(
+            X_train, y_train,
+            epochs=epochs,
+            batch_size=batch_size,
+            verbose=verbose,
+            **fit_kwargs,
+        )
         self.fitted = True
-    
-    def predict_gap(self, before: np.ndarray, after: np.ndarray,
-                   times: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        return history
+
+    def save(self, path: str):
+        """Save the trained Keras model."""
+        self.model.save(path)
+
+    @classmethod
+    def load(cls, path: str, context_length: Optional[int] = None,
+             gap_length: Optional[int] = None) -> "LSTMTrajectoryModel":
+        """Load a saved Keras LSTM gap-filler."""
+        if not TENSORFLOW_AVAILABLE:
+            raise ImportError("TensorFlow not available for LSTM model")
+
+        loaded_model = keras.models.load_model(path)
+        input_steps = int(loaded_model.input_shape[1])
+        output_steps = int(loaded_model.output_shape[1])
+
+        if context_length is None:
+            if input_steps % 2 != 0:
+                raise ValueError("Saved model input length is not split into two contexts")
+            context_length = input_steps // 2
+        if gap_length is None:
+            gap_length = output_steps
+
+        instance = cls(context_length=context_length, gap_length=gap_length)
+        if instance.sequence_length != input_steps or instance.gap_length != output_steps:
+            raise ValueError(
+                "Saved LSTM model shape does not match the requested context/gap lengths"
+            )
+
+        instance.model = loaded_model
+        instance.fitted = True
+        return instance
+
+    def predict_gap(
+        self,
+        before_positions: np.ndarray,
+        before_altitudes: np.ndarray,
+        before_times: np.ndarray,
+        after_positions: np.ndarray,
+        after_altitudes: np.ndarray,
+        after_times: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
         Predict trajectory to fill a gap.
-        
+
         Args:
-            before: Trajectory segment before gap
-            after: Trajectory segment after gap
-            times: Times for the gap
-        
+            before_positions: Positions before the gap
+            before_altitudes: Altitudes before the gap
+            before_times: Timestamps before the gap
+            after_positions: Positions after the gap
+            after_altitudes: Altitudes after the gap
+            after_times: Timestamps after the gap
+
         Returns:
             (predicted_lats, predicted_lons, predicted_alts)
         """
         if not self.fitted:
             raise ValueError("Model not trained yet")
-        
-        # Use data before gap as input
-        input_seq = before[-self.sequence_length:]
-        input_data = np.array([[
-            input_seq[i, 0],
-            input_seq[i, 1],
-            input_seq[i, 2] if len(input_seq[i]) > 2 else 0,
-            1  # time delta
-        ] for i in range(len(input_seq))])
-        
-        predictions = self.model.predict(input_data[np.newaxis, :], verbose=0)
-        
-        return predictions[0, :, 0], predictions[0, :, 1], predictions[0, :, 2]
+
+        features, _ = self._build_context_features(
+            before_positions, before_altitudes, before_times,
+            after_positions, after_altitudes, after_times,
+        )
+        predictions = self.model.predict(features[np.newaxis, :], verbose=0)[0]
+        baseline_positions, baseline_altitudes = self._linear_gap_baseline(
+            before_positions, before_altitudes,
+            after_positions, after_altitudes,
+            self.gap_length,
+        )
+
+        predicted_lats = baseline_positions[:, 0] + predictions[:, 0] / POSITION_SCALE
+        predicted_lons = baseline_positions[:, 1] + predictions[:, 1] / POSITION_SCALE
+        predicted_alts = baseline_altitudes + predictions[:, 2] * ALTITUDE_SCALE_METERS
+
+        return predicted_lats, predicted_lons, predicted_alts
 
 
 class FusionTrajectoryModel:
@@ -385,14 +593,27 @@ class FusionTrajectoryModel:
     • LSTM: Machine learning approach
     """
     
-    def __init__(self, use_lstm: bool = False):
+    def __init__(self, use_lstm: bool = False,
+                 lstm_weights_path: Optional[str] = None,
+                 lstm_context_length: int = 20,
+                 lstm_gap_length: int = 10):
         self.kf = ConstantVelocityKalmanFilter()
         self.smoother = KalmanSmoother()
         self.lstm_model = None
         
         if use_lstm:
             try:
-                self.lstm_model = LSTMTrajectoryModel()
+                if lstm_weights_path:
+                    self.lstm_model = LSTMTrajectoryModel.load(
+                        lstm_weights_path,
+                        context_length=lstm_context_length,
+                        gap_length=lstm_gap_length,
+                    )
+                else:
+                    self.lstm_model = LSTMTrajectoryModel(
+                        context_length=lstm_context_length,
+                        gap_length=lstm_gap_length,
+                    )
             except ImportError:
                 print("⚠ TensorFlow not available. LSTM model disabled.")
     
@@ -409,12 +630,40 @@ class FusionTrajectoryModel:
             before_*: Trajectory data before gap
             after_*: Trajectory data after gap
             gap_times: Times to fill
-            method: 'kalman' or 'smoother' (both always run kalman; 'smoother' also runs RTS smoother)
+            method: 'lstm', 'kalman', 'smoother', 'both', or 'all'. The
+                smoother path also returns the forward Kalman filter for
+                comparison.
         
         Returns:
             Dict with reconstruction from each available method
         """
+        method = method.lower()
+        if method not in ("lstm", "kalman", "smoother", "both", "all"):
+            raise ValueError(
+                "method must be one of: 'lstm', 'kalman', 'smoother', 'both', 'all'"
+            )
+
         results = {}
+
+        if method in ("lstm", "all"):
+            if self.lstm_model is None or not self.lstm_model.fitted:
+                raise ValueError("A trained LSTM model is required for method='lstm'")
+            if len(gap_times) != self.lstm_model.gap_length:
+                raise ValueError(
+                    f"LSTM expects {self.lstm_model.gap_length} gap points, "
+                    f"got {len(gap_times)}"
+                )
+
+            before_positions = np.column_stack([before_lat, before_lon])
+            after_positions = np.column_stack([after_lat, after_lon])
+            lstm_lats, lstm_lons, lstm_alts = self.lstm_model.predict_gap(
+                before_positions, before_alt, before_times,
+                after_positions, after_alt, after_times,
+            )
+            results["lstm"] = (lstm_lats, lstm_lons, lstm_alts)
+
+            if method == "lstm":
+                return results
 
         # Combine context from before and after, with placeholders for gap
         combined_times = np.concatenate([before_times, gap_times, after_times])
@@ -438,20 +687,21 @@ class FusionTrajectoryModel:
         gap_len = len(gap_times)
 
         # Kalman filter
-        try:
-            filtered_lats, filtered_lons, filtered_alts = self.kf.filter_trajectory(
-                combined_times, combined_positions, combined_alts, observed
-            )
-            results['kalman'] = (
-                filtered_lats[gap_idx:gap_idx + gap_len],
-                filtered_lons[gap_idx:gap_idx + gap_len],
-                filtered_alts[gap_idx:gap_idx + gap_len],
-            )
-        except Exception as e:
-            print(f"Kalman filter error: {e}")
+        if method in ("kalman", "smoother", "both", "all"):
+            try:
+                filtered_lats, filtered_lons, filtered_alts = self.kf.filter_trajectory(
+                    combined_times, combined_positions, combined_alts, observed
+                )
+                results['kalman'] = (
+                    filtered_lats[gap_idx:gap_idx + gap_len],
+                    filtered_lons[gap_idx:gap_idx + gap_len],
+                    filtered_alts[gap_idx:gap_idx + gap_len],
+                )
+            except Exception as e:
+                print(f"Kalman filter error: {e}")
 
         # Kalman smoother
-        if method in ('smoother', 'kalman'):
+        if method in ('smoother', 'both', 'all'):
             try:
                 smoothed_lats, smoothed_lons, smoothed_alts = self.smoother.smooth_trajectory(
                     combined_times, combined_positions, combined_alts, observed
@@ -482,10 +732,13 @@ class FusionTrajectoryModel:
         lat_error = np.mean(np.abs(true_positions[:, 0] - predicted_positions[:, 0]))
         lon_error = np.mean(np.abs(true_positions[:, 1] - predicted_positions[:, 1]))
 
-        # Simple Euclidean distance error (not great-circle, but for comparison)
-        dist_error = np.sqrt(np.mean(np.linalg.norm(
-            true_positions - predicted_positions, axis=1
-        ) ** 2))
+        position_errors = great_circle_km(
+            true_positions[:, 0],
+            true_positions[:, 1],
+            predicted_positions[:, 0],
+            predicted_positions[:, 1],
+        )
+        dist_error = np.sqrt(np.mean(position_errors ** 2))
 
         # Altitude error
         alt_error = 0.0
@@ -551,12 +804,12 @@ if __name__ == "__main__":
     )
     print(f"  Smoothed trajectory: {len(smooth_lats)} points")
     
-    print("\n[4] Model Comparison:")
+    print("\n[4] Project model:")
     print("  ✓ Constant-Velocity Kalman Filter: Lightweight, physics-based")
     print("  ✓ Kalman Smoother: Better for gaps, bidirectional")
     print("  ✓ LSTM Model: Learns complex patterns (requires training data)")
     
-    print("\n[5] Recommendations:")
+    print("\n[5] Recommended project flow:")
     print("  • Start with Kalman Smoother for trajectory gaps")
     print("  • Use when: gaps are small (<5 min), need fast inference")
     print("  • Train LSTM on complete trajectories for better long-term predictions")
