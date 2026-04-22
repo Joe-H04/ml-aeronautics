@@ -13,3 +13,7 @@ scikit-learn>=1.2.0
 # Machine Learning (Optional for LSTM model)
 tensorflow>=2.12.0
 keras>=2.12.0
+
+# API server (Step 7)
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0

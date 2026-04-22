@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(.venv/Scripts/python -c \"import ast; ast.parse\\(open\\('api.py'\\).read\\(\\)\\); print\\('syntax OK'\\)\")",
+      "Bash(.venv/Scripts/python -c \"import fastapi; print\\('fastapi', fastapi.__version__\\)\")",
+      "Bash(.venv/Scripts/pip install *)",
+      "Bash(.venv/Scripts/python -m pip install fastapi \"uvicorn[standard]\" --quiet)",
+      "Bash(python -m pip install fastapi \"uvicorn[standard]\" --quiet)",
+      "Bash(uv pip *)",
+      "Bash(.venv/Scripts/python -c \"import fastapi, uvicorn; print\\('fastapi', fastapi.__version__, '| uvicorn', uvicorn.__version__\\)\")",
+      "Bash(.venv/Scripts/python -c \"import api; print\\('api.py imports OK'\\)\")",
+      "Bash(.venv/Scripts/python -c \"import ast; ast.parse\\(open\\('api.py'\\).read\\(\\)\\); print\\('OK'\\)\")",
+      "Bash(.venv/Scripts/python -c \"import api; print\\('OK'\\)\")",
+      "Bash(python -c ' *)"
+    ]
+  }
+}

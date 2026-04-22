@@ -1,0 +1,593 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Aircraft Trajectory Reconstruction</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+      height: 100vh; display: flex; overflow: hidden; background: #0a0f1a;
+    }
+
+    /* ── Sidebar ─────────────────────────────────────────────── */
+    #sidebar {
+      width: 275px; min-width: 275px;
+      background: rgba(10,15,26,.93);
+      backdrop-filter: blur(14px);
+      display: flex; flex-direction: column;
+      border-right: 1px solid rgba(255,255,255,.07);
+      z-index: 1000; overflow-y: auto;
+    }
+    .sidebar-header {
+      padding: 15px 18px 13px;
+      border-bottom: 1px solid rgba(255,255,255,.07);
+    }
+    .sidebar-header h1 { font-size:.93rem; font-weight:700; color:#f0f9ff; letter-spacing:-.01em; }
+    .sidebar-header p  { font-size:.68rem; color:#3d5060; margin-top:3px; }
+
+    /* ── Tabs ────────────────────────────────────────────────── */
+    .tabs {
+      display: flex;
+      border-bottom: 1px solid rgba(255,255,255,.07);
+    }
+    .tab {
+      flex: 1; padding: 9px 0;
+      background: transparent; border: none;
+      font-size: .78rem; font-weight: 600; cursor: pointer;
+      color: #3d5060; transition: color .15s, border-bottom .15s;
+      border-bottom: 2px solid transparent;
+    }
+    .tab.active { color: #38bdf8; border-bottom-color: #38bdf8; }
+    .tab:hover:not(.active) { color: #7eb8d4; }
+
+    /* ── Panel ───────────────────────────────────────────────── */
+    .panel { display: flex; flex-direction: column; flex: 1; }
+    .panel.hidden { display: none; }
+
+    .section { padding: 13px 18px; border-bottom: 1px solid rgba(255,255,255,.06); }
+    .section-label {
+      font-size:.6rem; font-weight:700; text-transform:uppercase;
+      letter-spacing:.1em; color:#3d5060; margin-bottom:9px;
+    }
+
+    /* ── Input / Button ──────────────────────────────────────── */
+    input[type="text"] {
+      width:100%; background:rgba(255,255,255,.05);
+      border:1px solid rgba(255,255,255,.1); border-radius:7px;
+      padding:8px 11px; color:#e0f2fe; font-size:.8rem;
+      outline:none; transition:border-color .15s, background .15s;
+    }
+    input[type="text"]:focus { border-color:#38bdf8; background:rgba(56,189,248,.06); }
+    input[type="text"]::placeholder { color:#243040; }
+
+    .btn {
+      width:100%; margin-top:9px; padding:8px 14px; border:none;
+      border-radius:7px; font-size:.8rem; font-weight:600; cursor:pointer;
+      display:flex; align-items:center; justify-content:center; gap:6px;
+      transition:all .15s;
+    }
+    .btn-primary { background:linear-gradient(135deg,#0ea5e9,#2563eb); color:#fff; box-shadow:0 2px 12px rgba(14,165,233,.3); }
+    .btn-primary:hover { filter:brightness(1.1); }
+    .btn-primary:disabled { background:rgba(255,255,255,.06); color:#243040; box-shadow:none; cursor:not-allowed; }
+    .btn-ghost { background:rgba(255,255,255,.07); color:#7eb8d4; border:1px solid rgba(255,255,255,.1); }
+    .btn-ghost:hover { background:rgba(255,255,255,.12); }
+    .btn-sm {
+      flex:1; margin-top:0; padding:7px 10px; font-size:.75rem; font-weight:600;
+      border:none; border-radius:6px; cursor:pointer; background:rgba(255,255,255,.08);
+      color:#94a3b8; transition:background .15s;
+    }
+    .btn-sm:hover { background:rgba(255,255,255,.14); }
+    .btn-sm:disabled { color:#243040; cursor:not-allowed; }
+
+    /* ── Stats ───────────────────────────────────────────────── */
+    .stat-row { display:flex; justify-content:space-between; align-items:center; padding:3px 0; font-size:.77rem; }
+    .stat-label { color:#3d5060; }
+    .stat-value { color:#cbd5e1; font-weight:600; font-variant-numeric:tabular-nums; }
+    .c-cyan   { color:#38bdf8; }
+    .c-orange { color:#fb923c; }
+    .c-lime   { color:#a3e635; }
+    .c-white  { color:#f1f5f9; }
+    .c-green  { color:#4ade80; }
+    .c-red    { color:#f87171; }
+
+    .bar-track { height:4px; background:rgba(255,255,255,.07); border-radius:3px; margin:7px 0 4px; overflow:hidden; }
+    .bar-fill  { height:100%; border-radius:3px; background:linear-gradient(90deg,#38bdf8 var(--orig,100%),#fb923c var(--orig,100%)); transition:all .5s ease; }
+
+    /* ── Compare metrics card ────────────────────────────────── */
+    .metric-card {
+      border-radius:8px; padding:10px 12px; margin-bottom:7px;
+      border:1px solid rgba(255,255,255,.06);
+    }
+    .metric-label { font-size:.65rem; font-weight:700; text-transform:uppercase; letter-spacing:.08em; margin-bottom:5px; }
+    .metric-value { font-size:1.25rem; font-weight:700; font-variant-numeric:tabular-nums; }
+    .metric-sub   { font-size:.68rem; margin-top:2px; }
+    .card-orange  { background:rgba(251,146,60,.08); border-color:rgba(251,146,60,.2); }
+    .card-lime    { background:rgba(163,230,53,.08);  border-color:rgba(163,230,53,.2);  }
+    .card-white   { background:rgba(241,245,249,.05); border-color:rgba(241,245,249,.12); }
+
+    .winner-badge {
+      display:inline-block; font-size:.65rem; font-weight:700; padding:2px 7px;
+      border-radius:20px; background:rgba(74,222,128,.15); color:#4ade80;
+      border:1px solid rgba(74,222,128,.25); vertical-align:middle; margin-left:5px;
+    }
+
+    /* ── Gap nav ─────────────────────────────────────────────── */
+    .gap-nav { display:flex; align-items:center; gap:6px; }
+    .gap-counter { flex:1; text-align:center; font-size:.75rem; color:#7eb8d4; font-weight:600; }
+
+    /* ── Legend ──────────────────────────────────────────────── */
+    .legend-item { display:flex; align-items:center; gap:9px; padding:3px 0; font-size:.77rem; color:#94a3b8; }
+    .leg-line { width:22px; height:3px; border-radius:2px; flex-shrink:0; }
+    .leg-dash { width:22px; height:0; flex-shrink:0; border-top:3px dashed; }
+    .leg-dot  { width:8px; height:8px; border-radius:50%; flex-shrink:0; }
+
+    /* ── Error / spinner ─────────────────────────────────────── */
+    .error-box { background:rgba(127,29,29,.5); border:1px solid rgba(239,68,68,.4); border-radius:7px; padding:9px 11px; font-size:.75rem; color:#fca5a5; margin-top:9px; }
+    .spinner { width:13px; height:13px; border:2px solid rgba(255,255,255,.2); border-top-color:#fff; border-radius:50%; animation:spin .65s linear infinite; display:inline-block; }
+    @keyframes spin { to { transform:rotate(360deg); } }
+
+    /* ── Footer ──────────────────────────────────────────────── */
+    .sidebar-footer { margin-top:auto; padding:13px 18px; border-top:1px solid rgba(255,255,255,.06); }
+    .footer-hint { margin-top:8px; font-size:.66rem; color:#243040; text-align:center; line-height:1.6; }
+
+    .hidden { display:none !important; }
+
+    /* ── Map ─────────────────────────────────────────────────── */
+    #map { flex:1; height:100vh; }
+
+    /* ── Leaflet overrides ───────────────────────────────────── */
+    .leaflet-popup-content-wrapper {
+      background:rgba(10,15,26,.93)!important; backdrop-filter:blur(10px);
+      color:#e0f2fe!important; border:1px solid rgba(56,189,248,.2)!important;
+      border-radius:10px!important; box-shadow:0 8px 32px rgba(0,0,0,.6)!important;
+    }
+    .leaflet-popup-tip { background:rgba(10,15,26,.93)!important; }
+    .leaflet-popup-content { margin:11px 15px!important; font-size:.79rem!important; line-height:1.7!important; }
+    .leaflet-popup-content b { color:#38bdf8; }
+    .leaflet-popup-close-button { color:#3d5060!important; }
+    .leaflet-tooltip {
+      background:rgba(10,15,26,.9)!important; border:1px solid rgba(255,255,255,.1)!important;
+      color:#94a3b8!important; font-size:.71rem!important; padding:5px 9px!important;
+      border-radius:6px!important; box-shadow:0 4px 12px rgba(0,0,0,.4)!important;
+    }
+    .leaflet-control-layers { background:rgba(10,15,26,.88)!important; border:1px solid rgba(255,255,255,.1)!important; border-radius:8px!important; }
+    .leaflet-control-layers-expanded { color:#94a3b8!important; padding:8px 12px!important; }
+    .leaflet-control-zoom a { background:rgba(10,15,26,.85)!important; border-color:rgba(255,255,255,.1)!important; color:#94a3b8!important; }
+    .leaflet-control-zoom a:hover { background:rgba(56,189,248,.15)!important; color:#38bdf8!important; }
+  </style>
+</head>
+<body>
+
+<!-- ─────────────── SIDEBAR ─────────────── -->
+<div id="sidebar">
+
+  <div class="sidebar-header">
+    <h1>✈ Trajectory Reconstruction</h1>
+    <p>ADS-B / ADS-C gap-filling · LSTM model</p>
+  </div>
+
+  <!-- Tab bar -->
+  <div class="tabs">
+    <button class="tab active" id="tab-reconstruct" onclick="switchTab('reconstruct')">Reconstruct</button>
+    <button class="tab"        id="tab-compare"     onclick="switchTab('compare')">Compare Methods</button>
+  </div>
+
+  <!-- ══ RECONSTRUCT PANEL ══════════════════════════════════ -->
+  <div class="panel" id="panel-reconstruct">
+
+    <div class="section">
+      <div class="section-label">Flight ID</div>
+      <input type="text" id="rFlightInput" list="flightsList" placeholder="Select or type a flight ID…"/>
+      <datalist id="flightsList"></datalist>
+      <button class="btn btn-primary" id="rBtn" onclick="doReconstruct()">
+        <span id="rBtnIcon">🔍</span><span id="rBtnText">Reconstruct Trajectory</span>
+      </button>
+      <div id="rError" class="error-box hidden"></div>
+    </div>
+
+    <div id="rStats" class="section hidden">
+      <div class="section-label">Flight Summary</div>
+      <div class="stat-row"><span class="stat-label">ICAO24</span>   <span id="rIcao"     class="stat-value c-cyan">—</span></div>
+      <div class="stat-row"><span class="stat-label">Total pts</span><span id="rTotal"    class="stat-value">—</span></div>
+      <div class="stat-row"><span class="stat-label">Duration</span> <span id="rDuration" class="stat-value">—</span></div>
+      <div class="bar-track"><div id="rBar" class="bar-fill" style="--orig:100%"></div></div>
+      <div class="stat-row"><span class="stat-label">Original</span>      <span id="rOrig"   class="stat-value c-cyan">—</span></div>
+      <div class="stat-row"><span class="stat-label">Reconstructed</span> <span id="rFilled" class="stat-value c-orange">—</span></div>
+      <div style="height:5px"></div>
+      <div class="stat-row"><span class="stat-label">Gaps found / filled</span><span id="rGaps" class="stat-value">—</span></div>
+      <div style="height:5px"></div>
+      <div class="stat-row"><span class="stat-label">LSTM pts</span>         <span id="rLstm" class="stat-value c-orange">—</span></div>
+      <div class="stat-row"><span class="stat-label">Great-circle pts</span> <span id="rGC"   class="stat-value c-lime">—</span></div>
+    </div>
+
+    <div class="section">
+      <div class="section-label">Legend</div>
+      <div class="legend-item"><div class="leg-line" style="background:#38bdf8"></div>Original track</div>
+      <div class="legend-item"><div class="leg-line" style="background:#fb923c;height:4px"></div>LSTM gap-fill</div>
+      <div class="legend-item"><div class="leg-line" style="background:#a3e635;height:4px"></div>Great-circle fill</div>
+      <div class="legend-item"><div class="leg-dot"  style="background:#4ade80;box-shadow:0 0 5px #4ade80"></div>Departure</div>
+      <div class="legend-item"><div class="leg-dot"  style="background:#f87171;box-shadow:0 0 5px #f87171"></div>Arrival</div>
+    </div>
+
+    <div class="sidebar-footer">
+      <button id="rDownload" class="btn btn-ghost hidden" onclick="downloadJSON()">⬇ &nbsp;Download JSON</button>
+      <div class="footer-hint">Gap threshold: 120 s · Context: 20 pts · Fill: 10 pts</div>
+    </div>
+  </div><!-- /panel-reconstruct -->
+
+  <!-- ══ COMPARE PANEL ══════════════════════════════════════ -->
+  <div class="panel hidden" id="panel-compare">
+
+    <div class="section">
+      <div class="section-label">Flight ID</div>
+      <input type="text" id="cFlightInput" list="flightsList" placeholder="Select a dense flight…"/>
+      <button class="btn btn-primary" id="cBtn" onclick="doCompare()">
+        <span id="cBtnIcon">⚡</span><span id="cBtnText">Compare Methods</span>
+      </button>
+      <div id="cError" class="error-box hidden"></div>
+    </div>
+
+    <!-- Gap navigation -->
+    <div id="cNav" class="section hidden">
+      <div class="section-label">Gap Position</div>
+      <div class="gap-nav">
+        <button class="btn-sm" id="cPrev" onclick="navGap(-1)">← Prev</button>
+        <span id="cCounter" class="gap-counter">Gap 1 / 10</span>
+        <button class="btn-sm" id="cNext" onclick="navGap(+1)">Next →</button>
+      </div>
+    </div>
+
+    <!-- Metrics -->
+    <div id="cStats" class="section hidden">
+      <div class="section-label">Reconstruction Error (mean km)</div>
+      <div id="cLstmCard" class="metric-card card-orange">
+        <div class="metric-label" style="color:#fb923c">🤖 LSTM</div>
+        <div class="metric-value c-orange" id="cLstmErr">—</div>
+        <div class="metric-sub" style="color:#6b3a1f" id="cLstmSub">mean position error</div>
+      </div>
+      <div class="metric-card card-lime">
+        <div class="metric-label" style="color:#a3e635">🌐 Great-circle</div>
+        <div class="metric-value c-lime" id="cGCErr">—</div>
+        <div class="metric-sub" style="color:#3a5a10" id="cGCSub">mean position error</div>
+      </div>
+      <div class="metric-card card-white" id="cImprovCard">
+        <div class="metric-label" style="color:#94a3b8">📊 Improvement</div>
+        <div class="metric-value c-white" id="cImprove">—</div>
+        <div class="metric-sub" style="color:#475569">LSTM vs great-circle</div>
+      </div>
+    </div>
+
+    <!-- Legend -->
+    <div class="section">
+      <div class="section-label">Legend</div>
+      <div class="legend-item"><div class="leg-line" style="background:#38bdf8;opacity:.4"></div>Full flight (background)</div>
+      <div class="legend-item"><div class="leg-dash" style="border-color:#f1f5f9;opacity:.7"></div>Ground truth (hidden)</div>
+      <div class="legend-item"><div class="leg-line" style="background:#fb923c;height:4px"></div>LSTM reconstruction</div>
+      <div class="legend-item"><div class="leg-line" style="background:#a3e635;height:4px"></div>Great-circle baseline</div>
+      <div class="legend-item"><div class="leg-dot"  style="background:#fb923c"></div>LSTM point</div>
+      <div class="legend-item"><div class="leg-dot"  style="background:#a3e635"></div>GC point</div>
+      <div class="legend-item"><div class="leg-dot"  style="background:#f1f5f9;opacity:.6"></div>Truth point</div>
+    </div>
+
+    <div class="sidebar-footer">
+      <div class="footer-hint">
+        Gap: 10 hidden pts · Context: 20 pts each side<br>
+        Shows any flight with ≥ 50 original points
+      </div>
+    </div>
+  </div><!-- /panel-compare -->
+
+</div><!-- /sidebar -->
+
+<!-- ─────────────── MAP ─────────────── -->
+<div id="map"></div>
+
+<script>
+// ── Map ───────────────────────────────────────────────────────────────────────
+const satellite = L.tileLayer(
+  'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+  { attribution:'Imagery © Esri, Maxar, Earthstar Geographics', maxZoom:19 }
+);
+const labels = L.tileLayer(
+  'https://services.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}',
+  { maxZoom:19, opacity:.8 }
+);
+const dark = L.tileLayer(
+  'https://{s}.basemaps.cartocdn.com/dark_matter/{z}/{x}/{y}{r}.png',
+  { attribution:'© OpenStreetMap contributors © CARTO', subdomains:'abcd', maxZoom:20 }
+);
+const map = L.map('map', { layers:[satellite, labels] }).setView([30, 10], 3);
+L.control.layers(
+  { '🛰 Satellite': satellite, '🌙 Dark': dark },
+  { '🏷 Labels': labels },
+  { position:'topright', collapsed:false }
+).addTo(map);
+
+// ── State ─────────────────────────────────────────────────────────────────────
+let rLayers = [];           // reconstruct layers
+let cLayers = [];           // compare layers
+let rLastResult = null;
+let cCurrentFlight = null;
+let cCurrentGap = 0;
+let cTotalGaps = 0;
+
+// ── Populate datalist ─────────────────────────────────────────────────────────
+(async () => {
+  try {
+    const flights = await fetch('/flights').then(r => r.json());
+    const dl = document.getElementById('flightsList');
+    flights.forEach(id => {
+      const o = document.createElement('option'); o.value = id; dl.appendChild(o);
+    });
+  } catch (_) {}
+})();
+
+// ── Tab switching ─────────────────────────────────────────────────────────────
+function switchTab(tab) {
+  document.getElementById('panel-reconstruct').classList.toggle('hidden', tab !== 'reconstruct');
+  document.getElementById('panel-compare').classList.toggle('hidden',     tab !== 'compare');
+  document.getElementById('tab-reconstruct').classList.toggle('active',   tab === 'reconstruct');
+  document.getElementById('tab-compare').classList.toggle('active',       tab === 'compare');
+}
+
+// ── Enter key helpers ─────────────────────────────────────────────────────────
+document.getElementById('rFlightInput').addEventListener('keydown', e => { if (e.key==='Enter') doReconstruct(); });
+document.getElementById('cFlightInput').addEventListener('keydown', e => { if (e.key==='Enter') doCompare(); });
+
+// ──────────────────────────────────────────────────────────────────────────────
+// RECONSTRUCT TAB
+// ──────────────────────────────────────────────────────────────────────────────
+const SRC_COLOR  = { original:'#38bdf8', lstm:'#fb923c', great_circle:'#a3e635' };
+const SRC_WEIGHT = { original:2.5,        lstm:3.5,       great_circle:3.5       };
+const SRC_GLOW   = { original:8,          lstm:12,        great_circle:12        };
+
+async function doReconstruct() {
+  const id = document.getElementById('rFlightInput').value.trim();
+  if (!id) { showErr('rError','Enter a flight ID.'); return; }
+  setLoad('rBtn','rBtnIcon','rBtnText', true, 'Reconstructing…', 'Reconstruct Trajectory');
+  hideErr('rError'); clearLayers(rLayers);
+  try {
+    const data = await apiFetch(`/reconstruct/${encodeURIComponent(id)}`);
+    rLastResult = data;
+    renderReconstruct(data);
+  } catch(e) { showErr('rError', e.message); }
+  finally     { setLoad('rBtn','rBtnIcon','rBtnText', false, 'Reconstructing…', 'Reconstruct Trajectory'); }
+}
+
+function renderReconstruct(data) {
+  const track = data.track;
+  updateRStats(data, track);
+
+  // Background shadow
+  addL(rLayers, L.polyline(track.map(p=>[p.latitude,p.longitude]), {color:'#000',weight:5,opacity:.3}));
+
+  // Segments
+  drawSegments(track, rLayers);
+
+  // Endpoints
+  const fmt = t => new Date(t*1000).toUTCString().replace(/:\d{2} GMT$/,' UTC');
+  addEndMarker(rLayers, track[0],            '#4ade80','#166534', `<b>Departure</b><br>${data.icao24}<br><small style="color:#475569">${fmt(track[0].time)}</small>`);
+  addEndMarker(rLayers, track[track.length-1],'#f87171','#7f1d1d',`<b>Arrival</b><br>${data.icao24}<br><small style="color:#475569">${fmt(track[track.length-1].time)}</small>`);
+
+  map.fitBounds(L.latLngBounds(track.map(p=>[p.latitude,p.longitude])),{padding:[50,50]});
+  document.getElementById('rDownload').classList.remove('hidden');
+}
+
+function drawSegments(track, layers) {
+  let s = 0;
+  for (let i = 1; i <= track.length; i++) {
+    if (i === track.length || track[i].source !== track[s].source) {
+      const src = track[s].source;
+      const from = s > 0 ? s-1 : s;
+      const to   = i < track.length ? i : i-1;
+      const pts  = track.slice(from, to+1).map(p=>[p.latitude,p.longitude]);
+
+      // Glow
+      addL(layers, L.polyline(pts, {color:SRC_COLOR[src], weight:SRC_GLOW[src], opacity: src==='original'?.1:.25}));
+      // Core
+      const line = L.polyline(pts, {color:SRC_COLOR[src], weight:SRC_WEIGHT[src], opacity: src==='original'?.85:1});
+      if (src !== 'original') {
+        const n = i-s;
+        line.bindPopup(`<b>${src==='lstm'?'🤖 LSTM fill':'🌐 Great-circle fill'}</b><br>${n} point${n!==1?'s':''} reconstructed`);
+      }
+      addL(layers, line);
+
+      // Dots for reconstructed
+      if (src !== 'original') {
+        for (let j = s; j < i; j++) {
+          const p = track[j];
+          const dot = L.circleMarker([p.latitude,p.longitude],{radius:3,color:SRC_COLOR[src],fillColor:SRC_COLOR[src],fillOpacity:1,weight:0});
+          dot.bindTooltip(
+            `${src==='lstm'?'🤖 LSTM':'🌐 GC'} &nbsp;${p.latitude.toFixed(4)}, ${p.longitude.toFixed(4)}<br>`+
+            `Alt: ${Math.round(p.altitude_m)} m`,{sticky:true}
+          );
+          addL(layers, dot);
+        }
+      }
+      s = i;
+    }
+  }
+}
+
+function updateRStats(data, track) {
+  const lstmN = track.filter(p=>p.source==='lstm').length;
+  const gcN   = track.filter(p=>p.source==='great_circle').length;
+  const pct   = data.total_points>0 ? Math.round(data.original_points/data.total_points*100) : 100;
+  const dur   = Math.round((track[track.length-1].time - track[0].time)/60);
+  const durStr= dur>=60 ? `${Math.floor(dur/60)}h ${dur%60}m` : `${dur} min`;
+  set('rIcao', data.icao24);
+  set('rTotal', data.total_points.toLocaleString()+' pts');
+  set('rDuration', durStr);
+  set('rOrig',   `${data.original_points.toLocaleString()} (${pct}%)`);
+  set('rFilled', `${data.reconstructed_points.toLocaleString()} (${100-pct}%)`);
+  set('rGaps',   `${data.gaps_found} / ${data.gaps_filled}`);
+  set('rLstm',   lstmN.toLocaleString()+' pts');
+  set('rGC',     gcN.toLocaleString()+' pts');
+  document.getElementById('rBar').style.setProperty('--orig',`${pct}%`);
+  document.getElementById('rStats').classList.remove('hidden');
+}
+
+function downloadJSON() {
+  if (!rLastResult) return;
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([JSON.stringify(rLastResult,null,2)],{type:'application/json'}));
+  a.download = `${rLastResult.flight_id}_reconstructed.json`; a.click();
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// COMPARE TAB
+// ──────────────────────────────────────────────────────────────────────────────
+async function doCompare(gapOverride) {
+  const id = document.getElementById('cFlightInput').value.trim();
+  if (!id) { showErr('cError','Enter a flight ID.'); return; }
+  const gap = gapOverride !== undefined ? gapOverride : 0;
+  setLoad('cBtn','cBtnIcon','cBtnText', true, 'Loading…', 'Compare Methods');
+  hideErr('cError'); clearLayers(cLayers);
+  try {
+    const data = await apiFetch(`/demo/${encodeURIComponent(id)}?gap=${gap}`);
+    cCurrentFlight = id;
+    cCurrentGap   = data.gap_index;
+    cTotalGaps    = data.total_gaps;
+    renderCompare(data);
+  } catch(e) { showErr('cError', e.message); }
+  finally    { setLoad('cBtn','cBtnIcon','cBtnText', false, 'Loading…', 'Compare Methods'); }
+}
+
+function navGap(delta) {
+  if (!cCurrentFlight) return;
+  const next = Math.max(0, Math.min(cTotalGaps-1, cCurrentGap + delta));
+  if (next === cCurrentGap) return;
+  doCompare(next);
+}
+
+function renderCompare(data) {
+  // Background: full original flight (dim)
+  addL(cLayers, L.polyline(
+    data.full_track.map(p=>[p.latitude,p.longitude]),
+    {color:'#38bdf8', weight:1.5, opacity:.25}
+  ));
+
+  // Bridge anchors (last before + first after)
+  const truth = data.truth;
+  const gc    = data.great_circle;
+  const lstm  = data.lstm;
+
+  // Find the anchor points from full_track based on truth timestamps
+  // (first truth time - 1 and last truth time + 1 in full_track)
+  const tFirst = truth[0].time, tLast = truth[truth.length-1].time;
+  const before = data.full_track.filter(p=>p.time < tFirst);
+  const after  = data.full_track.filter(p=>p.time > tLast);
+  const pBefore = before.length ? before[before.length-1] : null;
+  const pAfter  = after.length  ? after[0]                : null;
+
+  function bridged(pts) {
+    const result = [];
+    if (pBefore) result.push([pBefore.latitude, pBefore.longitude]);
+    pts.forEach(p => result.push([p.latitude, p.longitude]));
+    if (pAfter)  result.push([pAfter.latitude, pAfter.longitude]);
+    return result;
+  }
+
+  // Ground truth — white dashed
+  const truthPts = bridged(truth);
+  addL(cLayers, L.polyline(truthPts, {color:'#f1f5f9', weight:2.5, opacity:.75, dashArray:'6 5'}));
+  truth.forEach(p => {
+    const dot = L.circleMarker([p.latitude,p.longitude],{radius:4,color:'#f1f5f9',fillColor:'#0a0f1a',fillOpacity:1,weight:2});
+    dot.bindTooltip(`Truth · ${p.latitude.toFixed(4)}, ${p.longitude.toFixed(4)}<br>Alt: ${Math.round(p.altitude_m)} m`,{sticky:true});
+    addL(cLayers, dot);
+  });
+
+  // LSTM
+  if (lstm) {
+    const lstmPts = bridged(lstm);
+    addL(cLayers, L.polyline(lstmPts, {color:'#fb923c', weight:10, opacity:.2}));
+    addL(cLayers, L.polyline(lstmPts, {color:'#fb923c', weight:3.5, opacity:1}));
+    lstm.forEach(p => {
+      const dot = L.circleMarker([p.latitude,p.longitude],{radius:4.5,color:'#fb923c',fillColor:'#fb923c',fillOpacity:1,weight:0});
+      dot.bindTooltip(`🤖 LSTM · ${p.latitude.toFixed(4)}, ${p.longitude.toFixed(4)}<br>Alt: ${Math.round(p.altitude_m)} m`,{sticky:true});
+      addL(cLayers, dot);
+    });
+  }
+
+  // Great-circle
+  const gcPts = bridged(gc);
+  addL(cLayers, L.polyline(gcPts, {color:'#a3e635', weight:10, opacity:.2}));
+  addL(cLayers, L.polyline(gcPts, {color:'#a3e635', weight:3.5, opacity:1}));
+  gc.forEach(p => {
+    const dot = L.circleMarker([p.latitude,p.longitude],{radius:4.5,color:'#a3e635',fillColor:'#a3e635',fillOpacity:1,weight:0});
+    dot.bindTooltip(`🌐 GC · ${p.latitude.toFixed(4)}, ${p.longitude.toFixed(4)}<br>Alt: ${Math.round(p.altitude_m)} m`,{sticky:true});
+    addL(cLayers, dot);
+  });
+
+  // Zoom to the gap area
+  const allGapPts = [...truth, ...gc, ...(lstm||[])].map(p=>[p.latitude,p.longitude]);
+  map.fitBounds(L.latLngBounds(allGapPts), {padding:[80,80]});
+
+  // Update stats
+  updateCStats(data);
+
+  // Gap navigation
+  set('cCounter', `Gap ${data.gap_index+1} / ${data.total_gaps}`);
+  document.getElementById('cPrev').disabled = data.gap_index === 0;
+  document.getElementById('cNext').disabled = data.gap_index === data.total_gaps-1;
+  document.getElementById('cNav').classList.remove('hidden');
+}
+
+function updateCStats(data) {
+  const le = data.lstm_mean_error_km;
+  const ge = data.gc_mean_error_km;
+
+  set('cLstmErr', le !== null ? le.toFixed(2)+' km' : '—  (needs ≥50 pts)');
+  set('cGCErr',   ge.toFixed(2)+' km');
+
+  // sub-labels
+  if (le !== null) {
+    const winner = le < ge ? 'lstm' : 'gc';
+    document.getElementById('cLstmSub').innerHTML = le < ge
+      ? 'mean error <span class="winner-badge">✓ WINNER</span>' : 'mean error';
+    document.getElementById('cGCSub').innerHTML   = le >= ge
+      ? 'mean error <span class="winner-badge">✓ WINNER</span>' : 'mean error';
+    const improv = ((ge - le) / ge * 100);
+    set('cImprove', improv > 0
+      ? `LSTM ${improv.toFixed(1)}% better`
+      : `GC ${(-improv).toFixed(1)}% better`);
+    document.getElementById('cImprove').className =
+      'metric-value ' + (improv > 0 ? 'c-green' : 'c-red');
+  } else {
+    set('cImprove', 'LSTM unavailable');
+  }
+  document.getElementById('cStats').classList.remove('hidden');
+}
+
+// ── Shared helpers ────────────────────────────────────────────────────────────
+function addEndMarker(layers, point, fill, stroke, popup) {
+  const m = L.circleMarker([point.latitude,point.longitude],{radius:8,color:stroke,fillColor:fill,fillOpacity:1,weight:2.5}).bindPopup(popup);
+  addL(layers, m);
+}
+function addL(layers, layer) { layer.addTo(map); layers.push(layer); }
+function clearLayers(arr)    { arr.forEach(l=>map.removeLayer(l)); arr.length=0; }
+function set(id, v)          { document.getElementById(id).textContent = v; }
+function showErr(id, msg)    { const b=document.getElementById(id); b.textContent='⚠ '+msg; b.classList.remove('hidden'); }
+function hideErr(id)         { document.getElementById(id).classList.add('hidden'); }
+
+function setLoad(btnId, iconId, textId, on, loadingText, defaultText) {
+  document.getElementById(btnId).disabled = on;
+  document.getElementById(iconId).innerHTML = on ? '<span class="spinner"></span>' : (btnId==='rBtn'?'🔍':'⚡');
+  document.getElementById(textId).textContent = on ? loadingText : defaultText;
+}
+
+async function apiFetch(url) {
+  const res = await fetch(url);
+  if (!res.ok) {
+    const err = await res.json().catch(()=>({detail:`HTTP ${res.status}`}));
+    throw new Error(err.detail || `HTTP ${res.status}`);
+  }
+  return res.json();
+}
+</script>
+</body>
+</html>
