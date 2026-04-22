@@ -2,8 +2,9 @@
 Phase 5: Evaluate the trained LSTM trajectory gap-filler.
 
 This hides fixed-length trajectory windows, reconstructs them with the LSTM,
-and compares against interpolation baselines. This is the model evaluation to
-use for the project report.
+and compares against interpolation baselines. Runs on data/clean/test_tracks/
+— the held-out split the pipeline reserved, so the model never saw these
+flights during training. This is the evaluation to use for the project report.
 """
 
 from pathlib import Path
@@ -15,7 +16,7 @@ from baseline import interpolate_great_circle
 from model import LSTMTrajectoryModel, great_circle_km
 
 
-TRACKS_DIR = Path("data/clean/tracks")
+TRACKS_DIR = Path("data/clean/test_tracks")
 WEIGHTS_PATH = Path("weights/lstm_residual_trajectory.keras")
 OUTPUT_CSV = Path("evaluation_results.csv")
 

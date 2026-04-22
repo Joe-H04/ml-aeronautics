@@ -11,7 +11,13 @@
       "Bash(.venv/Scripts/python -c \"import api; print\\('api.py imports OK'\\)\")",
       "Bash(.venv/Scripts/python -c \"import ast; ast.parse\\(open\\('api.py'\\).read\\(\\)\\); print\\('OK'\\)\")",
       "Bash(.venv/Scripts/python -c \"import api; print\\('OK'\\)\")",
-      "Bash(python -c ' *)"
+      "Bash(python -c ' *)",
+      "Bash(python -c \"import sys; print\\(sys.executable\\)\")",
+      "Bash(pip show *)",
+      "Bash(.venv/Scripts/python data_pipeline.py)",
+      "Bash(.venv/bin/python -m pip install pyopensky)",
+      "Bash(.venv/Scripts/python.exe -m pip install pyopensky)",
+      "Bash(.venv/Scripts/python.exe -m ensurepip)"
     ]
   }
 }

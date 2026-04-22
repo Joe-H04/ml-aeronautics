@@ -1,19 +1,24 @@
 """
 Train the bidirectional LSTM trajectory gap-filler on OpenSky ADS-B flights.
 
-Loads parquet trajectories from data/clean/tracks/, splits by flight (no
-leakage across train/val), trains a bidirectional LSTM that reconstructs a
-GAP_LENGTH-point gap given CONTEXT_LENGTH points on each side, saves the
-weights, and benchmarks on held-out gaps against the great-circle baseline.
+Loads parquet trajectories from data/clean/tracks/ for training (split 80/20
+into train/val by flight), then benchmarks the final model on the held-out
+data/clean/test_tracks/ flights which were never seen during training.
 """
 
 import glob
+import platform
 from pathlib import Path
 from typing import List, Tuple
 
 import numpy as np
 import pandas as pd
 from tensorflow.keras.callbacks import EarlyStopping
+
+try:
+    import tensorflow as tf
+except ImportError:
+    tf = None
 
 from baseline import interpolate_great_circle
 from model import LSTMTrajectoryModel
@@ -24,8 +29,37 @@ GAP_LENGTH = 10
 EPOCHS = 50
 BATCH_SIZE = 32
 TRACK_DIR = "data/clean/tracks"
+TEST_TRACK_DIR = "data/clean/test_tracks"
 WEIGHTS_PATH = "weights/lstm_residual_trajectory.keras"
 SEED = 42
+
+
+def describe_runtime() -> None:
+    """Print the TensorFlow runtime/device setup before training starts."""
+    print(f"[0] Python {platform.python_version()} on {platform.system()}")
+
+    if tf is None:
+        print("    TensorFlow is not installed in this environment.")
+        return
+
+    print(f"    TensorFlow {tf.__version__}")
+    gpus = tf.config.list_physical_devices("GPU")
+
+    if gpus:
+        for gpu in gpus:
+            try:
+                tf.config.experimental.set_memory_growth(gpu, True)
+            except RuntimeError:
+                pass
+
+        gpu_names = ", ".join(gpu.name for gpu in gpus)
+        print(f"    GPU devices: {gpu_names}")
+        return
+
+    print("    No TensorFlow GPU detected; training will run on CPU.")
+    if platform.system() == "Windows":
+        print("    Native Windows TensorFlow 2.11+ does not use NVIDIA CUDA GPUs.")
+        print("    Use WSL2 + Linux TensorFlow for RTX 5070/5070 Ti acceleration.")
 
 
 def load_trajectories(track_dir: str
@@ -108,12 +142,17 @@ def evaluate_on_gaps(model: LSTMTrajectoryModel,
 
 
 def main():
+    describe_runtime()
     np.random.seed(SEED)
 
-    print(f"[1] Loading trajectories from {TRACK_DIR}/")
+    print(f"[1] Loading trajectories from {TRACK_DIR}/ (train) "
+          f"and {TEST_TRACK_DIR}/ (held-out test)")
     trajectories = load_trajectories(TRACK_DIR)
+    test_trajs = load_trajectories(TEST_TRACK_DIR)
     total_points = sum(len(p) for p, _, _ in trajectories)
-    print(f"    Usable flights: {len(trajectories)}  total points: {total_points}")
+    test_points = sum(len(p) for p, _, _ in test_trajs)
+    print(f"    Train/val flights: {len(trajectories)}  total points: {total_points}")
+    print(f"    Test flights:      {len(test_trajs)}  total points: {test_points}")
 
     perm = np.random.permutation(len(trajectories))
     split = int(len(trajectories) * 0.8)
@@ -139,7 +178,7 @@ def main():
     print(f"\n[4] Training ({EPOCHS} epochs, batch={BATCH_SIZE})")
     history = lstm.train(
         X_train, y_train,
-        epochs=EPOCHS, batch_size=BATCH_SIZE, verbose=2,
+        epochs=EPOCHS, batch_size=BATCH_SIZE, verbose=1,
         validation_data=(X_val, y_val) if len(X_val) else None,
         callbacks=[
             EarlyStopping(
@@ -154,16 +193,28 @@ def main():
     lstm.save(WEIGHTS_PATH)
     print(f"\n[5] Saved weights -> {WEIGHTS_PATH}")
 
-    print("\n[6] Held-out gap benchmark (mean great-circle error per predicted point)")
-    results = evaluate_on_gaps(lstm, val_trajs)
-    print(f"    samples:                {results['n_samples']}")
-    print(f"    LSTM gap-fill:          {results['lstm']:.3f} km")
-    print(f"    Great-circle baseline:  {results['great_circle']:.3f} km")
-    print(f"    Linear baseline:        {results['linear']:.3f} km")
+    print("\n[6] Validation-set gap benchmark (sanity check, seen during training split)")
+    val_results = evaluate_on_gaps(lstm, val_trajs)
+    print(f"    samples:                {val_results['n_samples']}")
+    print(f"    LSTM gap-fill:          {val_results['lstm']:.3f} km")
+    print(f"    Great-circle baseline:  {val_results['great_circle']:.3f} km")
+    print(f"    Linear baseline:        {val_results['linear']:.3f} km")
 
-    if results["great_circle"] > 0:
-        gain = (results["great_circle"] - results["lstm"]) / results["great_circle"] * 100
-        print(f"\n    LSTM vs great-circle baseline: {gain:+.1f}%")
+    if not test_trajs:
+        print(f"\n[7] No flights in {TEST_TRACK_DIR}/ — skipping held-out test benchmark")
+        return
+
+    print(f"\n[7] Held-out TEST benchmark on {TEST_TRACK_DIR}/ "
+          "(flights never seen during training)")
+    test_results = evaluate_on_gaps(lstm, test_trajs)
+    print(f"    samples:                {test_results['n_samples']}")
+    print(f"    LSTM gap-fill:          {test_results['lstm']:.3f} km")
+    print(f"    Great-circle baseline:  {test_results['great_circle']:.3f} km")
+    print(f"    Linear baseline:        {test_results['linear']:.3f} km")
+
+    if test_results["great_circle"] > 0:
+        gain = (test_results["great_circle"] - test_results["lstm"]) / test_results["great_circle"] * 100
+        print(f"\n    LSTM vs great-circle baseline (test): {gain:+.1f}%")
 
 
 if __name__ == "__main__":

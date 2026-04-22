@@ -1,7 +1,12 @@
 """
 Phase 5: Evaluation on held-out gap segments.
 Compares baseline (great-circle) vs Kalman methods against ground truth.
+
+Picks a flight from data/clean/test_tracks/ (held-out by the pipeline) so the
+evaluation is on data the model never saw during training.
 """
+import glob
+import sys
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -13,8 +18,21 @@ from model import FusionTrajectoryModel
 
 # ---------- Part A: Load a clean flight and create a fake gap ----------
 
-TRACK_FILE = "data/clean/tracks/3c4a0f_1775147070.parquet"
+TEST_TRACK_DIR = "data/clean/test_tracks"
 GAP_DURATION_SEC = 20 * 60   # hide 20 minutes from the middle
+
+# Allow CLI override, otherwise pick the longest flight from test_tracks/
+# so the fake gap fits comfortably inside the trajectory.
+if len(sys.argv) > 1:
+    TRACK_FILE = sys.argv[1]
+else:
+    candidates = sorted(glob.glob(f"{TEST_TRACK_DIR}/*.parquet"))
+    if not candidates:
+        raise SystemExit(
+            f"No parquet flights in {TEST_TRACK_DIR}/. "
+            "Run data_pipeline.py first (test-ratio>0) or pass a file as arg."
+        )
+    TRACK_FILE = max(candidates, key=lambda p: pd.read_parquet(p, columns=["time"]).shape[0])
 
 df = pd.read_parquet(TRACK_FILE)
 df = df.sort_values("time").reset_index(drop=True)
