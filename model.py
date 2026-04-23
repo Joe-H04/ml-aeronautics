@@ -423,19 +423,23 @@ class LSTMTrajectoryModel:
         ]).astype(np.float32)
 
     def prepare_training_data(self, trajectories: List[Tuple[np.ndarray, np.ndarray, np.ndarray]],
-                             output_length: Optional[int] = None) -> Tuple[np.ndarray, np.ndarray]:
+                             output_length: Optional[int] = None,
+                             window_stride: int = 1) -> Tuple[np.ndarray, np.ndarray]:
         """
         Prepare training data for LSTM.
 
         Args:
             trajectories: List of (positions, altitudes, times) tuples
             output_length: Optional compatibility parameter; must match gap_length
+            window_stride: Sample every Nth training window to reduce overlap
 
         Returns:
             (X_train, y_train) ready for model training
         """
         if output_length is not None and output_length != self.gap_length:
             raise ValueError("output_length must match the model gap_length")
+        if window_stride < 1:
+            raise ValueError("window_stride must be >= 1")
 
         X, y = [], []
         window_length = 2 * self.context_length + self.gap_length
@@ -444,7 +448,7 @@ class LSTMTrajectoryModel:
             if len(positions) < window_length:
                 continue
 
-            for start in range(len(positions) - window_length + 1):
+            for start in range(0, len(positions) - window_length + 1, window_stride):
                 before_slc = slice(start, start + self.context_length)
                 gap_slc = slice(
                     start + self.context_length,

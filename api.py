@@ -4,6 +4,8 @@ Step 7: FastAPI service for aircraft trajectory reconstruction.
 Endpoints:
   GET  /health                  - health check + model status
   GET  /flights                 - list available flight IDs from local parquet files
+  GET  /opensky/flights         - list live OpenSky flights in a map area
+  GET  /opensky/reconstruct/... - reconstruct a live OpenSky track
   GET  /reconstruct/{flight_id} - reconstruct a stored flight (icao24_firstSeen)
   POST /reconstruct             - reconstruct from raw track points
 
@@ -25,6 +27,7 @@ from pydantic import BaseModel, Field
 
 from baseline import interpolate_great_circle
 from model import LSTMTrajectoryModel, great_circle_km
+from opensky_client import OpenSkyClient, OpenSkyError, OpenSkyHTTPError
 
 # ---------------------------------------------------------------------------
 # Config
@@ -41,6 +44,7 @@ GAP_THRESHOLD_SECONDS = 120  # time gap larger than this triggers gap-filling
 # ---------------------------------------------------------------------------
 
 _model: Optional[LSTMTrajectoryModel] = None
+_opensky = OpenSkyClient()
 
 
 @asynccontextmanager
@@ -121,6 +125,25 @@ class DemoResponse(BaseModel):
     great_circle: List[ComparisonPoint]
     lstm_mean_error_km: Optional[float]
     gc_mean_error_km: Optional[float]
+
+
+class OpenSkyFlight(BaseModel):
+    icao24: str
+    callsign: str
+    origin_country: str
+    time_position: Optional[int]
+    last_contact: int
+    longitude: float
+    latitude: float
+    altitude_m: Optional[float]
+    velocity_mps: Optional[float]
+    on_ground: bool
+
+
+class OpenSkyFlightsResponse(BaseModel):
+    auth_mode: Literal["oauth", "anonymous"]
+    count: int
+    flights: List[OpenSkyFlight]
 
 
 # ---------------------------------------------------------------------------
@@ -273,6 +296,48 @@ def _load_parquet(path: Path):
     return positions, altitudes, times, icao24
 
 
+def _load_opensky_track(icao24: str, time_seconds: int):
+    track = _opensky.get_track(icao24, time_seconds=time_seconds)
+    raw_path = track.get("path") or []
+
+    cleaned = []
+    last_altitude = 0.0
+    for point in raw_path:
+        if len(point) < 4:
+            continue
+
+        point_time, lat, lon, baro_altitude = point[:4]
+        if point_time is None or lat is None or lon is None:
+            continue
+
+        altitude = float(baro_altitude) if baro_altitude is not None else last_altitude
+        last_altitude = altitude
+        cleaned.append((float(point_time), float(lat), float(lon), altitude))
+
+    cleaned.sort(key=lambda point: point[0])
+
+    if len(cleaned) < 2:
+        raise HTTPException(
+            status_code=422,
+            detail="OpenSky returned too few valid track points to reconstruct.",
+        )
+
+    times = np.array([point[0] for point in cleaned], dtype=np.float64)
+    positions = np.array([[point[1], point[2]] for point in cleaned], dtype=np.float64)
+    altitudes = np.array([point[3] for point in cleaned], dtype=np.float64)
+    track_icao24 = str(track.get("icao24") or icao24).strip().lower()
+    callsign = str(track.get("callsign") or track.get("calllsign") or "").strip()
+    return positions, altitudes, times, track_icao24, callsign
+
+
+def _raise_from_opensky(exc: OpenSkyError):
+    if isinstance(exc, OpenSkyHTTPError):
+        status_code = exc.status_code or 502
+        if status_code in {400, 401, 403, 404, 429}:
+            raise HTTPException(status_code=status_code, detail=str(exc)) from exc
+    raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
@@ -290,6 +355,8 @@ def health():
     return {
         "status": "ok",
         "lstm_loaded": _model is not None,
+        "opensky_auth_mode": _opensky.auth_mode,
+        "opensky_auth_configured": _opensky.is_configured,
         "tracks_dir": str(TRACKS_DIR),
         "tracks_available": len(list(TRACKS_DIR.glob("*.parquet"))) if TRACKS_DIR.exists() else 0,
     }
@@ -301,6 +368,43 @@ def list_flights():
     if not TRACKS_DIR.exists():
         raise HTTPException(status_code=404, detail=f"Tracks directory not found: {TRACKS_DIR}")
     return sorted(p.stem for p in TRACKS_DIR.glob("*.parquet"))
+
+
+@app.get("/opensky/flights", response_model=OpenSkyFlightsResponse)
+def list_opensky_flights(
+    query: str = "",
+    limit: int = 25,
+    lamin: Optional[float] = None,
+    lamax: Optional[float] = None,
+    lomin: Optional[float] = None,
+    lomax: Optional[float] = None,
+):
+    """List live OpenSky flights, optionally filtered to the current map bounds."""
+    if any(value is None for value in (lamin, lamax, lomin, lomax)) and any(
+        value is not None for value in (lamin, lamax, lomin, lomax)
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail="lamin, lamax, lomin, and lomax must be provided together.",
+        )
+
+    try:
+        flights = _opensky.list_current_flights(
+            lamin=lamin,
+            lamax=lamax,
+            lomin=lomin,
+            lomax=lomax,
+            limit=limit,
+            query=query,
+        )
+    except OpenSkyError as exc:
+        _raise_from_opensky(exc)
+
+    return OpenSkyFlightsResponse(
+        auth_mode=_opensky.auth_mode,
+        count=len(flights),
+        flights=[OpenSkyFlight(**flight) for flight in flights],
+    )
 
 
 @app.get("/reconstruct/{flight_id}", response_model=ReconstructionResponse)
@@ -320,6 +424,26 @@ def reconstruct_flight(flight_id: str):
         raise HTTPException(status_code=422, detail="Track is empty after cleaning.")
 
     return reconstruct_track(positions, altitudes, times, flight_id, icao24)
+
+
+@app.get("/opensky/reconstruct/{icao24}", response_model=ReconstructionResponse)
+def reconstruct_opensky_flight(icao24: str, time: int = 0):
+    """
+    Reconstruct a track fetched live from OpenSky instead of from the local parquet folder.
+
+    `time=0` asks OpenSky for the live track. Passing `last_contact` from `/opensky/flights`
+    is often a little more robust when selecting a current aircraft from the list.
+    """
+    try:
+        positions, altitudes, times, track_icao24, callsign = _load_opensky_track(icao24, time)
+    except OpenSkyError as exc:
+        _raise_from_opensky(exc)
+
+    flight_label = f"opensky_{track_icao24}_{int(times[0])}"
+    if callsign:
+        flight_label = f"{flight_label}_{callsign.strip().replace(' ', '')}"
+
+    return reconstruct_track(positions, altitudes, times, flight_label, track_icao24)
 
 
 @app.post("/reconstruct", response_model=ReconstructionResponse)

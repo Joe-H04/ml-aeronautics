@@ -6,6 +6,7 @@
   <title>Aircraft Trajectory Reconstruction</title>
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="https://unpkg.com/globe.gl@2.34.4"></script>
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
     body {
@@ -82,6 +83,45 @@
     }
     .btn-sm:hover { background:rgba(255,255,255,.14); }
     .btn-sm:disabled { color:#243040; cursor:not-allowed; }
+    .btn-sm.active {
+      background:linear-gradient(135deg,#0ea5e9,#2563eb);
+      color:#fff;
+      box-shadow:0 2px 8px rgba(14,165,233,.25);
+    }
+    .source-switch { display:flex; gap:8px; }
+    .source-note {
+      margin-top:8px; font-size:.68rem; line-height:1.5; color:#587285;
+    }
+    .opensky-list {
+      margin-top:10px; display:flex; flex-direction:column; gap:7px;
+      max-height:220px; overflow-y:auto;
+    }
+    .flight-card {
+      width:100%; background:rgba(255,255,255,.05); border:1px solid rgba(255,255,255,.08);
+      border-radius:8px; padding:9px 10px; text-align:left; cursor:pointer;
+      transition:background .15s, border-color .15s, transform .15s;
+    }
+    .flight-card:hover:not(.empty) {
+      background:rgba(56,189,248,.08); border-color:rgba(56,189,248,.24); transform:translateY(-1px);
+    }
+    .flight-card.selected {
+      background:rgba(56,189,248,.12); border-color:rgba(56,189,248,.34);
+      box-shadow:0 4px 16px rgba(14,165,233,.12);
+    }
+    .flight-card.empty {
+      cursor:default; color:#587285; font-size:.72rem;
+    }
+    .flight-title {
+      display:flex; justify-content:space-between; gap:10px; align-items:center;
+      color:#e0f2fe; font-size:.77rem; font-weight:600;
+    }
+    .flight-title code {
+      font-size:.68rem; color:#7dd3fc; background:rgba(56,189,248,.08);
+      padding:2px 5px; border-radius:5px;
+    }
+    .flight-sub {
+      margin-top:5px; color:#7eb8d4; font-size:.68rem; line-height:1.5;
+    }
 
     /* ── Stats ───────────────────────────────────────────────── */
     .stat-row { display:flex; justify-content:space-between; align-items:center; padding:3px 0; font-size:.77rem; }
@@ -136,8 +176,60 @@
 
     .hidden { display:none !important; }
 
-    /* ── Map ─────────────────────────────────────────────────── */
-    #map { flex:1; height:100vh; }
+    /* ── Map / 3D view container ─────────────────────────────── */
+    .view-area { flex:1; height:100vh; position:relative; }
+    #map      { width:100%; height:100%; }
+    #globe    { width:100%; height:100%; background:#000; overflow:hidden; }
+    #globe canvas { display:block; }
+    #map.hidden, #globe.hidden { display:none !important; }
+
+    .view-toggle {
+      position:absolute; top:12px; left:50%; transform:translateX(-50%);
+      z-index:500; display:flex;
+      background:rgba(10,15,26,.88); backdrop-filter:blur(10px);
+      border:1px solid rgba(255,255,255,.1); border-radius:9px;
+      padding:3px; box-shadow:0 4px 16px rgba(0,0,0,.5);
+    }
+    .view-btn {
+      background:transparent; border:none; padding:6px 14px;
+      font-size:.76rem; font-weight:600; color:#7eb8d4;
+      cursor:pointer; border-radius:6px; transition:all .15s;
+      display:flex; align-items:center; gap:5px;
+    }
+    .view-btn:hover:not(.active) { color:#38bdf8; background:rgba(56,189,248,.08); }
+    .view-btn.active { background:linear-gradient(135deg,#0ea5e9,#2563eb); color:#fff; box-shadow:0 2px 8px rgba(14,165,233,.35); }
+
+    .globe-empty {
+      position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
+      color:#94a3b8; font-size:.85rem; pointer-events:none; z-index:450;
+      text-shadow:0 2px 8px rgba(0,0,0,.8);
+    }
+    .globe-empty.hidden { display:none !important; }
+
+    .alt-control {
+      position:absolute; bottom:20px; left:50%; transform:translateX(-50%);
+      z-index:500; display:flex; align-items:center; gap:10px;
+      background:rgba(10,15,26,.88); backdrop-filter:blur(10px);
+      border:1px solid rgba(255,255,255,.1); border-radius:9px;
+      padding:8px 14px; box-shadow:0 4px 16px rgba(0,0,0,.5);
+      font-size:.75rem; color:#7eb8d4; font-weight:600;
+    }
+    .alt-control.hidden { display:none !important; }
+    .alt-control input[type="range"] {
+      width:140px; accent-color:#38bdf8;
+    }
+    .alt-control .alt-val { color:#38bdf8; min-width:26px; text-align:right; font-variant-numeric:tabular-nums; }
+
+    .globe-legend {
+      position:absolute; top:64px; left:12px; z-index:500;
+      background:rgba(10,15,26,.88); backdrop-filter:blur(10px);
+      border:1px solid rgba(255,255,255,.1); border-radius:9px;
+      padding:10px 12px; box-shadow:0 4px 16px rgba(0,0,0,.5);
+      font-size:.72rem; color:#cbd5e1;
+    }
+    .globe-legend.hidden { display:none !important; }
+    .globe-legend .section-label { margin-bottom:6px; font-size:.58rem; }
+    .globe-legend .legend-item { font-size:.72rem; padding:2px 0; }
 
     /* ── Leaflet overrides ───────────────────────────────────── */
     .leaflet-popup-content-wrapper {
@@ -180,11 +272,34 @@
   <div class="panel" id="panel-reconstruct">
 
     <div class="section">
+      <div class="section-label">Data Source</div>
+      <div class="source-switch">
+        <button class="btn-sm active" id="rSourceLocal" onclick="setReconstructSource('local')">Stored Flights</button>
+        <button class="btn-sm" id="rSourceOpenSky" onclick="setReconstructSource('opensky')">OpenSky Live</button>
+      </div>
+    </div>
+
+    <div class="section" id="rLocalSource">
       <div class="section-label">Flight ID</div>
       <input type="text" id="rFlightInput" list="flightsList" placeholder="Select or type a flight ID…"/>
       <datalist id="flightsList"></datalist>
+    </div>
+
+    <div class="section hidden" id="rOpenSkySource">
+      <div class="section-label">OpenSky Flights</div>
+      <input type="text" id="oFlightQuery" placeholder="Filter by ICAO24, callsign, or country"/>
+      <button class="btn btn-ghost" id="oLoadBtn" onclick="loadOpenSkyFlights()">
+        <span id="oLoadIcon">&#8635;</span><span id="oLoadText">Load Flights In Current Map</span>
+      </button>
+      <div id="oStatus" class="source-note">Zoom or pan the map, then load live flights from the current map view.</div>
+      <div id="oFlights" class="opensky-list">
+        <div class="flight-card empty">No OpenSky flights loaded yet.</div>
+      </div>
+    </div>
+
+    <div class="section">
       <button class="btn btn-primary" id="rBtn" onclick="doReconstruct()">
-        <span id="rBtnIcon">🔍</span><span id="rBtnText">Reconstruct Trajectory</span>
+        <span id="rBtnIcon">&#128269;</span><span id="rBtnText">Reconstruct Trajectory</span>
       </button>
       <div id="rError" class="error-box hidden"></div>
     </div>
@@ -226,7 +341,7 @@
       <div class="section-label">Flight ID</div>
       <input type="text" id="cFlightInput" list="flightsList" placeholder="Select a dense flight…"/>
       <button class="btn btn-primary" id="cBtn" onclick="doCompare()">
-        <span id="cBtnIcon">⚡</span><span id="cBtnText">Compare Methods</span>
+        <span id="cBtnIcon">&#9889;</span><span id="cBtnText">Compare Methods</span>
       </button>
       <div id="cError" class="error-box hidden"></div>
     </div>
@@ -283,8 +398,21 @@
 
 </div><!-- /sidebar -->
 
-<!-- ─────────────── MAP ─────────────── -->
-<div id="map"></div>
+<!-- ─────────────── MAP / 3D ─────────────── -->
+<div class="view-area">
+  <div id="map"></div>
+  <div id="globe" class="hidden"></div>
+  <div class="globe-empty hidden" id="globeEmpty">Run a reconstruction or comparison to populate the 3D globe.</div>
+  <div class="globe-legend hidden" id="globeLegend"></div>
+  <div class="view-toggle">
+    <button class="view-btn active" id="btn2d" onclick="toggleView('2d')">🗺 2D Map</button>
+    <button class="view-btn"        id="btn3d" onclick="toggleView('3d')">🌐 3D Globe</button>
+  </div>
+  <div class="alt-control hidden" id="altControl">
+    <span>Altitude × <span class="alt-val" id="altVal">40</span></span>
+    <input type="range" id="altRange" min="1" max="150" value="40" oninput="setAltExag(this.value)"/>
+  </div>
+</div>
 
 <script>
 // ── Map ───────────────────────────────────────────────────────────────────────
@@ -311,12 +439,17 @@ L.control.layers(
 let rLayers = [];           // reconstruct layers
 let cLayers = [];           // compare layers
 let rLastResult = null;
+let cLastResult = null;
 let cCurrentFlight = null;
 let cCurrentGap = 0;
 let cTotalGaps = 0;
+let reconstructSource = 'local';
+let openSkyFlights = [];
+let selectedOpenSkyFlight = null;
+let view3D = false;
 
 // ── Populate datalist ─────────────────────────────────────────────────────────
-(async () => {
+async function loadLocalFlights() {
   try {
     const flights = await fetch('/flights').then(r => r.json());
     const dl = document.getElementById('flightsList');
@@ -324,7 +457,117 @@ let cTotalGaps = 0;
       const o = document.createElement('option'); o.value = id; dl.appendChild(o);
     });
   } catch (_) {}
-})();
+}
+
+loadLocalFlights();
+document.getElementById('oLoadIcon').innerHTML = '&#8635;';
+
+function reconstructButtonLabel() {
+  return reconstructSource === 'opensky' ? 'Reconstruct Selected Flight' : 'Reconstruct Trajectory';
+}
+
+function setReconstructSource(source) {
+  reconstructSource = source;
+  document.getElementById('rSourceLocal').classList.toggle('active', source === 'local');
+  document.getElementById('rSourceOpenSky').classList.toggle('active', source === 'opensky');
+  document.getElementById('rLocalSource').classList.toggle('hidden', source !== 'local');
+  document.getElementById('rOpenSkySource').classList.toggle('hidden', source !== 'opensky');
+  document.getElementById('rBtnText').textContent = reconstructButtonLabel();
+  hideErr('rError');
+}
+
+setReconstructSource('local');
+
+function formatRelativeAge(ts) {
+  const age = Math.max(0, Math.round(Date.now() / 1000 - ts));
+  if (age < 60) return `${age}s ago`;
+  if (age < 3600) return `${Math.round(age / 60)}m ago`;
+  return `${Math.round(age / 3600)}h ago`;
+}
+
+function formatAltitude(altitude) {
+  if (altitude === null || altitude === undefined) return 'alt n/a';
+  return `${Math.round(altitude).toLocaleString()} m`;
+}
+
+function renderOpenSkyFlights() {
+  const wrap = document.getElementById('oFlights');
+  wrap.innerHTML = '';
+
+  if (!openSkyFlights.length) {
+    const empty = document.createElement('div');
+    empty.className = 'flight-card empty';
+    empty.textContent = 'No live flights matched the current map view.';
+    wrap.appendChild(empty);
+    return;
+  }
+
+  openSkyFlights.forEach(flight => {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'flight-card' + (selectedOpenSkyFlight && selectedOpenSkyFlight.icao24 === flight.icao24 ? ' selected' : '');
+    btn.addEventListener('click', () => selectOpenSkyFlight(flight.icao24));
+
+    const title = document.createElement('div');
+    title.className = 'flight-title';
+    const callsign = document.createElement('span');
+    callsign.textContent = flight.callsign || 'No callsign';
+    const code = document.createElement('code');
+    code.textContent = flight.icao24;
+    title.appendChild(callsign);
+    title.appendChild(code);
+
+    const sub = document.createElement('div');
+    sub.className = 'flight-sub';
+    const speed = flight.velocity_mps !== null && flight.velocity_mps !== undefined
+      ? ` · ${Math.round(flight.velocity_mps)} m/s`
+      : '';
+    sub.textContent = `${flight.origin_country} | ${flight.on_ground ? 'on ground' : formatAltitude(flight.altitude_m)}${speed} | ${formatRelativeAge(flight.last_contact)}`;
+
+    btn.appendChild(title);
+    btn.appendChild(sub);
+    wrap.appendChild(btn);
+  });
+}
+
+function selectOpenSkyFlight(icao24) {
+  selectedOpenSkyFlight = openSkyFlights.find(flight => flight.icao24 === icao24) || null;
+  renderOpenSkyFlights();
+  if (!selectedOpenSkyFlight) return;
+  const label = selectedOpenSkyFlight.callsign || selectedOpenSkyFlight.icao24;
+  document.getElementById('oStatus').textContent =
+    `Selected ${label} from ${selectedOpenSkyFlight.origin_country}. Reconstruct when ready.`;
+  hideErr('rError');
+}
+
+async function loadOpenSkyFlights() {
+  const params = new URLSearchParams({ limit: '24' });
+  const query = document.getElementById('oFlightQuery').value.trim();
+  const bounds = map.getBounds();
+  params.set('lamin', bounds.getSouth().toFixed(4));
+  params.set('lamax', bounds.getNorth().toFixed(4));
+  params.set('lomin', bounds.getWest().toFixed(4));
+  params.set('lomax', bounds.getEast().toFixed(4));
+  if (query) params.set('query', query);
+
+  setLoad('oLoadBtn','oLoadIcon','oLoadText', true, 'Loading Flights...', 'Load Flights In Current Map');
+  hideErr('rError');
+  try {
+    const data = await apiFetch(`/opensky/flights?${params.toString()}`);
+    openSkyFlights = data.flights || [];
+    selectedOpenSkyFlight = null;
+    renderOpenSkyFlights();
+    document.getElementById('oStatus').textContent =
+      `Loaded ${data.count} live flights from OpenSky (${data.auth_mode}) in the current map view.`;
+  } catch (e) {
+    openSkyFlights = [];
+    selectedOpenSkyFlight = null;
+    renderOpenSkyFlights();
+    showErr('rError', e.message);
+  } finally {
+    setLoad('oLoadBtn','oLoadIcon','oLoadText', false, 'Loading Flights...', 'Load Flights In Current Map');
+  }
+}
 
 // ── Tab switching ─────────────────────────────────────────────────────────────
 function switchTab(tab) {
@@ -332,11 +575,17 @@ function switchTab(tab) {
   document.getElementById('panel-compare').classList.toggle('hidden',     tab !== 'compare');
   document.getElementById('tab-reconstruct').classList.toggle('active',   tab === 'reconstruct');
   document.getElementById('tab-compare').classList.toggle('active',       tab === 'compare');
+  if (view3D) renderCurrentIn3D();
+}
+
+function activeTab() {
+  return document.getElementById('panel-reconstruct').classList.contains('hidden') ? 'compare' : 'reconstruct';
 }
 
 // ── Enter key helpers ─────────────────────────────────────────────────────────
 document.getElementById('rFlightInput').addEventListener('keydown', e => { if (e.key==='Enter') doReconstruct(); });
 document.getElementById('cFlightInput').addEventListener('keydown', e => { if (e.key==='Enter') doCompare(); });
+document.getElementById('oFlightQuery').addEventListener('keydown', e => { if (e.key==='Enter') loadOpenSkyFlights(); });
 
 // ──────────────────────────────────────────────────────────────────────────────
 // RECONSTRUCT TAB
@@ -346,16 +595,26 @@ const SRC_WEIGHT = { original:2.5,        lstm:3.5,       great_circle:3.5      
 const SRC_GLOW   = { original:8,          lstm:12,        great_circle:12        };
 
 async function doReconstruct() {
-  const id = document.getElementById('rFlightInput').value.trim();
-  if (!id) { showErr('rError','Enter a flight ID.'); return; }
+  let url = '';
+  const defaultText = reconstructButtonLabel();
+  if (reconstructSource === 'local') {
+    const id = document.getElementById('rFlightInput').value.trim();
+    if (!id) { showErr('rError','Enter a flight ID.'); return; }
+    url = `/reconstruct/${encodeURIComponent(id)}`;
+  } else {
+    if (!selectedOpenSkyFlight) { showErr('rError','Load and select an OpenSky flight first.'); return; }
+    const t = selectedOpenSkyFlight.last_contact || 0;
+    url = `/opensky/reconstruct/${encodeURIComponent(selectedOpenSkyFlight.icao24)}?time=${t}`;
+  }
   setLoad('rBtn','rBtnIcon','rBtnText', true, 'Reconstructing…', 'Reconstruct Trajectory');
   hideErr('rError'); clearLayers(rLayers);
   try {
-    const data = await apiFetch(`/reconstruct/${encodeURIComponent(id)}`);
+    const data = await apiFetch(url);
     rLastResult = data;
     renderReconstruct(data);
   } catch(e) { showErr('rError', e.message); }
   finally     { setLoad('rBtn','rBtnIcon','rBtnText', false, 'Reconstructing…', 'Reconstruct Trajectory'); }
+  document.getElementById('rBtnText').textContent = defaultText;
 }
 
 function renderReconstruct(data) {
@@ -375,6 +634,8 @@ function renderReconstruct(data) {
 
   map.fitBounds(L.latLngBounds(track.map(p=>[p.latitude,p.longitude])),{padding:[50,50]});
   document.getElementById('rDownload').classList.remove('hidden');
+
+  if (view3D) render3DReconstruct(data);
 }
 
 function drawSegments(track, layers) {
@@ -465,6 +726,8 @@ function navGap(delta) {
 }
 
 function renderCompare(data) {
+  cLastResult = data;
+
   // Background: full original flight (dim)
   addL(cLayers, L.polyline(
     data.full_track.map(p=>[p.latitude,p.longitude]),
@@ -535,6 +798,8 @@ function renderCompare(data) {
   document.getElementById('cPrev').disabled = data.gap_index === 0;
   document.getElementById('cNext').disabled = data.gap_index === data.total_gaps-1;
   document.getElementById('cNav').classList.remove('hidden');
+
+  if (view3D) render3DCompare(data);
 }
 
 function updateCStats(data) {
@@ -563,6 +828,216 @@ function updateCStats(data) {
   document.getElementById('cStats').classList.remove('hidden');
 }
 
+// ──────────────────────────────────────────────────────────────────────────────
+// 3D GLOBE (globe.gl / three.js)
+// ──────────────────────────────────────────────────────────────────────────────
+const R_EARTH_KM = 6371;
+let globe = null;
+let altExag = 40;  // altitude exaggeration factor (1 km → altExag km visually)
+
+const LEGEND_RECONSTRUCT = `
+  <div class="section-label">Legend</div>
+  <div class="legend-item"><span style="color:#38bdf8">━</span> Original track</div>
+  <div class="legend-item"><span style="color:#fb923c">━</span> 🤖 LSTM fill</div>
+  <div class="legend-item"><span style="color:#a3e635">━</span> 🌐 Great-circle fill</div>
+  <div class="legend-item"><span style="color:#4ade80">●</span> Departure &nbsp; <span style="color:#f87171">●</span> Arrival</div>`;
+
+const LEGEND_COMPARE = `
+  <div class="section-label">Legend</div>
+  <div class="legend-item"><span style="color:#38bdf8;opacity:.5">━</span> Full flight (context)</div>
+  <div class="legend-item"><span style="color:#f1f5f9">┈</span> Ground truth (hidden)</div>
+  <div class="legend-item"><span style="color:#fb923c">━</span> 🤖 LSTM reconstruction</div>
+  <div class="legend-item"><span style="color:#a3e635">━</span> 🌐 Great-circle baseline</div>`;
+
+function altToGlobe(alt_m) {
+  // Convert metres to globe-radius units, with exaggeration so altitude is visible.
+  return (alt_m / 1000) * altExag / R_EARTH_KM;
+}
+
+function initGlobe() {
+  if (globe) return globe;
+  const el = document.getElementById('globe');
+  globe = Globe()
+    .globeImageUrl('//unpkg.com/three-globe/example/img/earth-blue-marble.jpg')
+    .bumpImageUrl('//unpkg.com/three-globe/example/img/earth-topology.png')
+    .backgroundImageUrl('//unpkg.com/three-globe/example/img/night-sky.png')
+    .showAtmosphere(true)
+    .atmosphereColor('#38bdf8')
+    .atmosphereAltitude(0.18)
+    .pathPointLat(c => c[0])
+    .pathPointLng(c => c[1])
+    .pathPointAlt(c => c[2])
+    .pathColor(p => p.color)
+    .pathStroke(p => p.stroke)
+    .pathDashLength(p => p.dash ? 0.02 : 0)
+    .pathDashGap(p => p.dash ? 0.015 : 0)
+    .pathLabel(p => p.label)
+    .pathPoints(p => p.coords)
+    .pointLat('lat').pointLng('lng').pointAltitude('alt')
+    .pointColor('color').pointRadius('radius').pointLabel('label');
+  globe(el);
+  globe.width(el.clientWidth).height(el.clientHeight);
+  window.addEventListener('resize', resizeGlobe);
+  return globe;
+}
+
+function resizeGlobe() {
+  if (!globe) return;
+  const el = document.getElementById('globe');
+  globe.width(el.clientWidth).height(el.clientHeight);
+}
+
+function setAltExag(v) {
+  altExag = +v;
+  document.getElementById('altVal').textContent = v;
+  if (view3D) renderCurrentIn3D();
+}
+
+function toggleView(mode) {
+  const want3D = mode === '3d';
+  if (want3D === view3D) return;
+  view3D = want3D;
+  document.getElementById('btn2d').classList.toggle('active', !view3D);
+  document.getElementById('btn3d').classList.toggle('active',  view3D);
+  document.getElementById('map').classList.toggle('hidden',    view3D);
+  document.getElementById('globe').classList.toggle('hidden', !view3D);
+  document.getElementById('altControl').classList.toggle('hidden', !view3D);
+  document.getElementById('globeLegend').classList.toggle('hidden', !view3D);
+
+  if (view3D) {
+    initGlobe();
+    resizeGlobe();
+    renderCurrentIn3D();
+  } else {
+    setTimeout(() => map.invalidateSize(), 30);
+  }
+}
+
+function renderCurrentIn3D() {
+  const empty = document.getElementById('globeEmpty');
+  const legend = document.getElementById('globeLegend');
+  if (activeTab() === 'reconstruct') {
+    legend.innerHTML = LEGEND_RECONSTRUCT;
+    if (rLastResult) { empty.classList.add('hidden'); render3DReconstruct(rLastResult); }
+    else             { clearGlobe(); empty.classList.remove('hidden'); }
+  } else {
+    legend.innerHTML = LEGEND_COMPARE;
+    if (cLastResult) { empty.classList.add('hidden'); render3DCompare(cLastResult); }
+    else             { clearGlobe(); empty.classList.remove('hidden'); }
+  }
+}
+
+function clearGlobe() {
+  if (!globe) return;
+  globe.pathsData([]).pointsData([]);
+}
+
+function render3DReconstruct(data) {
+  document.getElementById('globeEmpty').classList.add('hidden');
+  const g = initGlobe();
+  const track = data.track;
+  const label = { original:'Original track', lstm:'🤖 LSTM fill', great_circle:'🌐 Great-circle fill' };
+
+  const paths = [];
+  let s = 0;
+  for (let i = 1; i <= track.length; i++) {
+    if (i === track.length || track[i].source !== track[s].source) {
+      const src  = track[s].source;
+      const from = s > 0 ? s - 1 : s;
+      const to   = i < track.length ? i : i - 1;
+      const seg  = track.slice(from, to + 1);
+      paths.push({
+        color: SRC_COLOR[src],
+        stroke: src === 'original' ? 0.5 : 1.2,
+        dash: false,
+        label: `<b style="color:${SRC_COLOR[src]}">${label[src]}</b><br>${seg.length} pts`,
+        coords: seg.map(p => [p.latitude, p.longitude, altToGlobe(p.altitude_m)])
+      });
+      s = i;
+    }
+  }
+
+  g.pathsData(paths);
+
+  // Departure / Arrival markers
+  const first = track[0], last = track[track.length - 1];
+  g.pointsData([
+    { lat:first.latitude, lng:first.longitude, alt:altToGlobe(first.altitude_m),
+      color:'#4ade80', radius:0.45,
+      label:`<b>Departure</b><br>${data.icao24}<br>alt ${Math.round(first.altitude_m)} m` },
+    { lat:last.latitude,  lng:last.longitude,  alt:altToGlobe(last.altitude_m),
+      color:'#f87171', radius:0.45,
+      label:`<b>Arrival</b><br>${data.icao24}<br>alt ${Math.round(last.altitude_m)} m` }
+  ]);
+
+  // Fly camera to midpoint
+  const mid = track[Math.floor(track.length / 2)];
+  g.pointOfView({ lat: mid.latitude, lng: mid.longitude, altitude: 1.2 }, 1200);
+}
+
+function render3DCompare(data) {
+  document.getElementById('globeEmpty').classList.add('hidden');
+  const g = initGlobe();
+  const truth = data.truth, gc = data.great_circle, lstm = data.lstm;
+  const tFirst = truth[0].time, tLast = truth[truth.length - 1].time;
+  const before = data.full_track.filter(p => p.time < tFirst);
+  const after  = data.full_track.filter(p => p.time > tLast);
+  const pBefore = before.length ? before[before.length - 1] : null;
+  const pAfter  = after.length  ? after[0]                  : null;
+  const bridge = pts => {
+    const arr = [];
+    if (pBefore) arr.push(pBefore);
+    pts.forEach(p => arr.push(p));
+    if (pAfter) arr.push(pAfter);
+    return arr;
+  };
+  const coords = pts => pts.map(p => [p.latitude, p.longitude, altToGlobe(p.altitude_m)]);
+
+  const paths = [
+    { color:'rgba(56,189,248,0.5)', stroke:0.3, dash:false,
+      label:'<b>Full flight</b>',
+      coords: coords(data.full_track) },
+    { color:'#f1f5f9', stroke:0.8, dash:true,
+      label:'<b>Ground truth</b> (hidden)',
+      coords: coords(bridge(truth)) }
+  ];
+  if (lstm) paths.push({
+    color:'#fb923c', stroke:1.6, dash:false,
+    label:`<b style="color:#fb923c">🤖 LSTM</b><br>mean err ${data.lstm_mean_error_km !== null ? data.lstm_mean_error_km.toFixed(2)+' km' : '—'}`,
+    coords: coords(bridge(lstm))
+  });
+  paths.push({
+    color:'#a3e635', stroke:1.6, dash:false,
+    label:`<b style="color:#a3e635">🌐 Great-circle</b><br>mean err ${data.gc_mean_error_km.toFixed(2)} km`,
+    coords: coords(bridge(gc))
+  });
+
+  g.pathsData(paths);
+
+  // Point markers for truth / LSTM / GC
+  const markers = [];
+  truth.forEach(p => markers.push({
+    lat:p.latitude, lng:p.longitude, alt:altToGlobe(p.altitude_m),
+    color:'#f1f5f9', radius:0.18,
+    label:`Truth · alt ${Math.round(p.altitude_m)} m`
+  }));
+  if (lstm) lstm.forEach(p => markers.push({
+    lat:p.latitude, lng:p.longitude, alt:altToGlobe(p.altitude_m),
+    color:'#fb923c', radius:0.28,
+    label:`🤖 LSTM · alt ${Math.round(p.altitude_m)} m`
+  }));
+  gc.forEach(p => markers.push({
+    lat:p.latitude, lng:p.longitude, alt:altToGlobe(p.altitude_m),
+    color:'#a3e635', radius:0.28,
+    label:`🌐 GC · alt ${Math.round(p.altitude_m)} m`
+  }));
+  g.pointsData(markers);
+
+  // Fly camera to gap centre, zoomed in
+  const centre = truth[Math.floor(truth.length / 2)];
+  g.pointOfView({ lat: centre.latitude, lng: centre.longitude, altitude: 0.45 }, 1200);
+}
+
 // ── Shared helpers ────────────────────────────────────────────────────────────
 function addEndMarker(layers, point, fill, stroke, popup) {
   const m = L.circleMarker([point.latitude,point.longitude],{radius:8,color:stroke,fillColor:fill,fillOpacity:1,weight:2.5}).bindPopup(popup);
@@ -576,7 +1051,9 @@ function hideErr(id)         { document.getElementById(id).classList.add('hidden
 
 function setLoad(btnId, iconId, textId, on, loadingText, defaultText) {
   document.getElementById(btnId).disabled = on;
-  document.getElementById(iconId).innerHTML = on ? '<span class="spinner"></span>' : (btnId==='rBtn'?'🔍':'⚡');
+  document.getElementById(iconId).innerHTML = on
+    ? '<span class="spinner"></span>'
+    : (btnId==='rBtn' ? '&#128269;' : btnId==='cBtn' ? '&#9889;' : '&#8635;');
   document.getElementById(textId).textContent = on ? loadingText : defaultText;
 }
 

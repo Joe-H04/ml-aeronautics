@@ -6,6 +6,7 @@ into train/val by flight), then benchmarks the final model on the held-out
 data/clean/test_tracks/ flights which were never seen during training.
 """
 
+import argparse
 import glob
 import platform
 from pathlib import Path
@@ -27,14 +28,50 @@ from model import LSTMTrajectoryModel
 CONTEXT_LENGTH = 20
 GAP_LENGTH = 10
 EPOCHS = 50
-BATCH_SIZE = 32
+BATCH_SIZE = 128
+WINDOW_STRIDE = 4
 TRACK_DIR = "data/clean/tracks"
 TEST_TRACK_DIR = "data/clean/test_tracks"
 WEIGHTS_PATH = "weights/lstm_residual_trajectory.keras"
 SEED = 42
 
 
-def describe_runtime() -> None:
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Train the bidirectional LSTM trajectory gap-filler."
+    )
+    parser.add_argument("--epochs", type=int, default=EPOCHS,
+                        help=f"Training epochs (default: {EPOCHS})")
+    parser.add_argument("--batch-size", type=int, default=BATCH_SIZE,
+                        help=f"Mini-batch size (default: {BATCH_SIZE})")
+    parser.add_argument("--window-stride", type=int, default=WINDOW_STRIDE,
+                        help=f"Use every Nth training window (default: {WINDOW_STRIDE})")
+    parser.add_argument("--mixed-precision", dest="mixed_precision", action="store_true",
+                        help="Enable TensorFlow mixed precision on GPU")
+    parser.add_argument("--no-mixed-precision", dest="mixed_precision", action="store_false",
+                        help="Disable TensorFlow mixed precision")
+    parser.set_defaults(mixed_precision=True)
+    return parser.parse_args()
+
+
+def configure_runtime(args: argparse.Namespace) -> None:
+    """Apply TensorFlow runtime settings before model creation."""
+    if tf is None:
+        return
+
+    gpus = tf.config.list_physical_devices("GPU")
+    for gpu in gpus:
+        try:
+            tf.config.experimental.set_memory_growth(gpu, True)
+        except RuntimeError:
+            pass
+
+    if gpus and args.mixed_precision:
+        from tensorflow.keras import mixed_precision
+        mixed_precision.set_global_policy("mixed_float16")
+
+
+def describe_runtime(args: argparse.Namespace) -> None:
     """Print the TensorFlow runtime/device setup before training starts."""
     print(f"[0] Python {platform.python_version()} on {platform.system()}")
 
@@ -46,17 +83,17 @@ def describe_runtime() -> None:
     gpus = tf.config.list_physical_devices("GPU")
 
     if gpus:
-        for gpu in gpus:
-            try:
-                tf.config.experimental.set_memory_growth(gpu, True)
-            except RuntimeError:
-                pass
-
         gpu_names = ", ".join(gpu.name for gpu in gpus)
         print(f"    GPU devices: {gpu_names}")
+        policy_name = tf.keras.mixed_precision.global_policy().name
+        print(f"    Mixed precision: {policy_name}")
+        print(f"    Training config: epochs={args.epochs}, batch={args.batch_size}, "
+              f"window_stride={args.window_stride}")
         return
 
     print("    No TensorFlow GPU detected; training will run on CPU.")
+    print(f"    Training config: epochs={args.epochs}, batch={args.batch_size}, "
+          f"window_stride={args.window_stride}")
     if platform.system() == "Windows":
         print("    Native Windows TensorFlow 2.11+ does not use NVIDIA CUDA GPUs.")
         print("    Use WSL2 + Linux TensorFlow for RTX 5070/5070 Ti acceleration.")
@@ -142,7 +179,9 @@ def evaluate_on_gaps(model: LSTMTrajectoryModel,
 
 
 def main():
-    describe_runtime()
+    args = parse_args()
+    configure_runtime(args)
+    describe_runtime(args)
     np.random.seed(SEED)
 
     print(f"[1] Loading trajectories from {TRACK_DIR}/ (train) "
@@ -166,8 +205,14 @@ def main():
     lstm.model.summary()
 
     print("\n[3] Preparing training windows")
-    X_train, y_train = lstm.prepare_training_data(train_trajs)
-    X_val, y_val = lstm.prepare_training_data(val_trajs)
+    X_train, y_train = lstm.prepare_training_data(
+        train_trajs,
+        window_stride=args.window_stride,
+    )
+    X_val, y_val = lstm.prepare_training_data(
+        val_trajs,
+        window_stride=args.window_stride,
+    )
     print(f"    X_train={X_train.shape}  y_train={y_train.shape}")
     print(f"    X_val  ={X_val.shape}  y_val  ={y_val.shape}")
 
@@ -175,10 +220,11 @@ def main():
         print("No training windows — aborting")
         return
 
-    print(f"\n[4] Training ({EPOCHS} epochs, batch={BATCH_SIZE})")
+    print(f"\n[4] Training ({args.epochs} epochs, batch={args.batch_size}, "
+          f"window_stride={args.window_stride})")
     history = lstm.train(
         X_train, y_train,
-        epochs=EPOCHS, batch_size=BATCH_SIZE, verbose=1,
+        epochs=args.epochs, batch_size=args.batch_size, verbose=1,
         validation_data=(X_val, y_val) if len(X_val) else None,
         callbacks=[
             EarlyStopping(
