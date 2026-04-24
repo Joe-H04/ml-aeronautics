@@ -1,27 +1,33 @@
-"""
-Phase 5: Evaluation on held-out gap segments.
-Compares baseline (great-circle) vs Kalman methods against ground truth.
-"""
+"""Evaluate baseline (great-circle) vs Kalman on held-out gap segments."""
+import glob
+import sys
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-from math import radians, sin, cos, atan2, sqrt
 
-# Import YOUR existing code
 from baseline import fill_trajectory_gaps, haversine_distance, interpolate_great_circle
 from model import FusionTrajectoryModel
 
-# ---------- Part A: Load a clean flight and create a fake gap ----------
 
-TRACK_FILE = "data/clean/tracks/3c4a0f_1775147070.parquet"
-GAP_DURATION_SEC = 20 * 60   # hide 20 minutes from the middle
+TEST_TRACK_DIR = "data/clean/test_tracks"
+GAP_DURATION_SEC = 20 * 60
+
+if len(sys.argv) > 1:
+    TRACK_FILE = sys.argv[1]
+else:
+    candidates = sorted(glob.glob(f"{TEST_TRACK_DIR}/*.parquet"))
+    if not candidates:
+        raise SystemExit(
+            f"No parquet flights in {TEST_TRACK_DIR}/. "
+            "Run data_pipeline.py first (test-ratio>0) or pass a file as arg."
+        )
+    TRACK_FILE = max(candidates, key=lambda p: pd.read_parquet(p, columns=["time"]).shape[0])
 
 df = pd.read_parquet(TRACK_FILE)
 df = df.sort_values("time").reset_index(drop=True)
 print(f"Loaded {len(df)} points from {TRACK_FILE}")
 print(f"  Duration: {(df['time'].max() - df['time'].min()) / 60:.1f} min")
 
-# Find the middle of the flight and cut out a chunk
 mid_time = (df["time"].min() + df["time"].max()) / 2
 gap_start = mid_time - GAP_DURATION_SEC / 2
 gap_end   = mid_time + GAP_DURATION_SEC / 2
@@ -37,14 +43,6 @@ print(f"  After gap: {len(after)} points")
 if len(truth) == 0:
     raise SystemExit("Truth segment is empty — pick a longer flight or shorter gap.")
 
-
-# ---------- Part B: Run reconstructions ----------
-
-# Baseline: great-circle interpolation across the gap
-# Baseline: great-circle interpolation directly across the gap
-# We use the LAST point before the gap and the FIRST point after the gap
-# as the two anchors, then interpolate along the great-circle arc at each
-# truth timestamp.
 
 anchor_before_lat = before["latitude"].iloc[-1]
 anchor_before_lon = before["longitude"].iloc[-1]
@@ -70,7 +68,7 @@ for t in truth["time"].values:
 
 baseline_lats = np.array(baseline_lats)
 baseline_lons = np.array(baseline_lons)
-# Kalman smoother
+
 fusion = FusionTrajectoryModel()
 result = fusion.reconstruct_gap(
     before_lat=before["latitude"].values,
@@ -86,21 +84,20 @@ result = fusion.reconstruct_gap(
 )
 
 
-# ---------- Part C: Compare to truth ----------
-
 def errors_km(true_lats, true_lons, pred_lats, pred_lons):
-    """Geodesic error per point, in km."""
     n = min(len(true_lats), len(pred_lats))
     return np.array([
         haversine_distance(true_lats[i], true_lons[i], pred_lats[i], pred_lons[i])
         for i in range(n)
     ])
+
+
 def path_length_km(lats, lons):
-    """Total geodesic length of a path, in km."""
     total = 0.0
     for i in range(len(lats) - 1):
         total += haversine_distance(lats[i], lons[i], lats[i + 1], lons[i + 1])
     return total
+
 
 def report(name, errs, pred_lats=None, pred_lons=None, truth_length=None):
     if len(errs) == 0:
@@ -116,7 +113,7 @@ def report(name, errs, pred_lats=None, pred_lons=None, truth_length=None):
         line += f"   path_err={diff:+6.2f} km ({pct:+5.1f}%)"
     print(line)
 
-    
+
 truth_length = path_length_km(truth["latitude"].values, truth["longitude"].values)
 print(f"\nTruth path length in gap: {truth_length:.2f} km")
 
@@ -139,8 +136,6 @@ if "kalman" in result:
     )
     report("kalman", errs_kf, kf_lats, kf_lons, truth_length)
 
-
-# ---------- Part D: Plot ----------
 
 fig, ax = plt.subplots(figsize=(10, 8))
 ax.plot(before["longitude"], before["latitude"], "b.", label="before gap", markersize=4)

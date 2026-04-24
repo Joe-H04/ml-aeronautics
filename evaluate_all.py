@@ -1,205 +1,211 @@
-"""
-Phase 5 (multi-flight): Evaluate reconstruction across all track files.
-This script is the multi-flight version of evaluate.py.
-"""
-import numpy as np
-import pandas as pd
+"""Evaluate the trained LSTM gap-filler on held-out test tracks."""
+
 from pathlib import Path
 
-from baseline import haversine_distance, interpolate_great_circle
-from model import FusionTrajectoryModel
+import numpy as np
+import pandas as pd
+
+from baseline import interpolate_great_circle
+from model import LSTMTrajectoryModel, great_circle_km
 
 
-# ---------- Configuration ----------
+TRACKS_DIR = Path("data/clean/test_tracks")
+WEIGHTS_PATH = Path("weights/lstm_residual_trajectory.keras")
+OUTPUT_CSV = Path("evaluation_results.csv")
 
-TRACKS_DIR = Path("data/clean/tracks")
-GAP_DURATION_SEC = 10 * 60        # 10 minutes (smaller so more flights qualify)
-MIN_BEFORE_AFTER_POINTS = 10      # need at least this many on each side
-MIN_TRUTH_POINTS = 5              # need at least this many hidden points
-
-
-# ---------- Helpers ----------
-
-def errors_km(true_lats, true_lons, pred_lats, pred_lons):
-    n = min(len(true_lats), len(pred_lats))
-    return np.array([
-        haversine_distance(true_lats[i], true_lons[i], pred_lats[i], pred_lons[i])
-        for i in range(n)
-    ])
+CONTEXT_LENGTH = 20
+GAP_LENGTH = 10
+GAPS_PER_FLIGHT = 3
+SEED = 42
 
 
-def path_length_km(lats, lons):
-    total = 0.0
-    for i in range(len(lats) - 1):
-        total += haversine_distance(lats[i], lons[i], lats[i + 1], lons[i + 1])
-    return total
+def load_track(path):
+    df = pd.read_parquet(path).sort_values("time").reset_index(drop=True)
+    df = df.dropna(subset=["latitude", "longitude", "baro_altitude"])
 
+    min_len = 2 * CONTEXT_LENGTH + GAP_LENGTH
+    if len(df) < min_len:
+        return None
 
-def evaluate_one_flight(parquet_path):
-    """
-    Run baseline + smoother + filter on one flight.
-    Returns a dict of results, or None if the flight can't be evaluated.
-    """
-    df = pd.read_parquet(parquet_path)
-    df = df.sort_values("time").reset_index(drop=True)
-
-    # Cut a gap from the middle
-    mid_time = (df["time"].min() + df["time"].max()) / 2
-    gap_start = mid_time - GAP_DURATION_SEC / 2
-    gap_end   = mid_time + GAP_DURATION_SEC / 2
-
-    before = df[df["time"] < gap_start]
-    truth  = df[(df["time"] >= gap_start) & (df["time"] <= gap_end)]
-    after  = df[df["time"] > gap_end]
-
-    # Safety checks
-    if len(before) < MIN_BEFORE_AFTER_POINTS:
-        return None, "too few points before gap"
-    if len(after) < MIN_BEFORE_AFTER_POINTS:
-        return None, "too few points after gap"
-    if len(truth) < MIN_TRUTH_POINTS:
-        return None, "too few hidden truth points"
-
-    # Baseline: great-circle interpolation between anchor points
-    a_b_lat = before["latitude"].iloc[-1]
-    a_b_lon = before["longitude"].iloc[-1]
-    a_b_t   = before["time"].iloc[-1]
-    a_a_lat = after["latitude"].iloc[0]
-    a_a_lon = after["longitude"].iloc[0]
-    a_a_t   = after["time"].iloc[0]
-    span = a_a_t - a_b_t
-
-    baseline_lats, baseline_lons = [], []
-    for t in truth["time"].values:
-        f = (t - a_b_t) / span
-        lat, lon = interpolate_great_circle(a_b_lat, a_b_lon, a_a_lat, a_a_lon, f)
-        baseline_lats.append(lat)
-        baseline_lons.append(lon)
-    baseline_lats = np.array(baseline_lats)
-    baseline_lons = np.array(baseline_lons)
-
-    # Kalman filter and smoother
-    fusion = FusionTrajectoryModel()
-    result = fusion.reconstruct_gap(
-        before_lat=before["latitude"].values,
-        before_lon=before["longitude"].values,
-        before_alt=before["baro_altitude"].values,
-        before_times=before["time"].values,
-        after_lat=after["latitude"].values,
-        after_lon=after["longitude"].values,
-        after_alt=after["baro_altitude"].values,
-        after_times=after["time"].values,
-        gap_times=truth["time"].values,
-        method="smoother",
+    return (
+        df[["latitude", "longitude"]].to_numpy(dtype=np.float64),
+        df["baro_altitude"].to_numpy(dtype=np.float64),
+        df["time"].to_numpy(dtype=np.float64),
     )
 
-    truth_lats = truth["latitude"].values
-    truth_lons = truth["longitude"].values
-    truth_length = path_length_km(truth_lats, truth_lons)
 
-    out = {
-        "flight": parquet_path.stem,
-        "n_truth_points": len(truth),
-        "truth_length_km": truth_length,
+def path_length_km(positions):
+    if len(positions) < 2:
+        return 0.0
+    return float(np.sum(
+        great_circle_km(
+            positions[:-1, 0],
+            positions[:-1, 1],
+            positions[1:, 0],
+            positions[1:, 1],
+        )
+    ))
+
+
+def interpolate_baselines(p_before, p_after):
+    fractions = np.linspace(
+        1 / (GAP_LENGTH + 1),
+        GAP_LENGTH / (GAP_LENGTH + 1),
+        GAP_LENGTH,
+        dtype=np.float64,
+    )
+
+    great_circle = np.array([
+        interpolate_great_circle(
+            p_before[0],
+            p_before[1],
+            p_after[0],
+            p_after[1],
+            fraction,
+        )
+        for fraction in fractions
+    ])
+
+    linear = p_before + (p_after - p_before) * fractions[:, np.newaxis]
+    return great_circle, linear
+
+
+def error_summary(truth, prediction):
+    errors = great_circle_km(
+        truth[:, 0],
+        truth[:, 1],
+        prediction[:, 0],
+        prediction[:, 1],
+    )
+    return {
+        "mean_error_km": float(np.mean(errors)),
+        "median_error_km": float(np.median(errors)),
+        "p95_error_km": float(np.percentile(errors, 95)),
+        "path_error_km": float(path_length_km(prediction) - path_length_km(truth)),
     }
 
-    # Baseline metrics
-    e = errors_km(truth_lats, truth_lons, baseline_lats, baseline_lons)
-    out["baseline_median"] = np.median(e)
-    out["baseline_p95"]    = np.percentile(e, 95)
-    out["baseline_path_err"] = path_length_km(baseline_lats, baseline_lons) - truth_length
 
-    # Smoother metrics
-    if "smoother" in result:
-        sm_lats, sm_lons, _ = result["smoother"]
-        e = errors_km(truth_lats, truth_lons, sm_lats, sm_lons)
-        out["smoother_median"] = np.median(e)
-        out["smoother_p95"]    = np.percentile(e, 95)
-        out["smoother_path_err"] = path_length_km(sm_lats, sm_lons) - truth_length
+def evaluate_window(model, path, positions, altitudes, times, start):
+    window = 2 * CONTEXT_LENGTH + GAP_LENGTH
 
-    # Filter metrics
-    if "kalman" in result:
-        kf_lats, kf_lons, _ = result["kalman"]
-        e = errors_km(truth_lats, truth_lons, kf_lats, kf_lons)
-        out["kalman_median"] = np.median(e)
-        out["kalman_p95"]    = np.percentile(e, 95)
-        out["kalman_path_err"] = path_length_km(kf_lats, kf_lons) - truth_length
+    before_slc = slice(start, start + CONTEXT_LENGTH)
+    gap_slc = slice(start + CONTEXT_LENGTH, start + CONTEXT_LENGTH + GAP_LENGTH)
+    after_slc = slice(start + CONTEXT_LENGTH + GAP_LENGTH, start + window)
 
-    return out, None
+    truth = positions[gap_slc]
 
+    lstm_lat, lstm_lon, _ = model.predict_gap(
+        positions[before_slc],
+        altitudes[before_slc],
+        times[before_slc],
+        positions[after_slc],
+        altitudes[after_slc],
+        times[after_slc],
+    )
+    lstm_prediction = np.column_stack([lstm_lat, lstm_lon])
 
-# ---------- Main loop ----------
+    p_before = positions[start + CONTEXT_LENGTH - 1]
+    p_after = positions[start + CONTEXT_LENGTH + GAP_LENGTH]
+    great_circle, linear = interpolate_baselines(p_before, p_after)
+
+    row = {
+        "flight": path.stem,
+        "start_index": int(start),
+        "truth_path_km": path_length_km(truth),
+    }
+
+    for method, prediction in [
+        ("lstm", lstm_prediction),
+        ("great_circle", great_circle),
+        ("linear", linear),
+    ]:
+        summary = error_summary(truth, prediction)
+        for metric, value in summary.items():
+            row[f"{method}_{metric}"] = value
+
+    return row
+
 
 def main():
-    track_files = sorted(TRACKS_DIR.glob("*.parquet"))
-    print(f"Found {len(track_files)} track files\n")
-    print(f"Gap duration: {GAP_DURATION_SEC // 60} minutes\n")
+    if not WEIGHTS_PATH.exists():
+        raise SystemExit(
+            f"No trained LSTM weights found at {WEIGHTS_PATH}. "
+            "Run `python train_lstm.py` first."
+        )
 
+    print(f"Loading LSTM weights from {WEIGHTS_PATH}")
+    model = LSTMTrajectoryModel.load(
+        str(WEIGHTS_PATH),
+        context_length=CONTEXT_LENGTH,
+        gap_length=GAP_LENGTH,
+    )
+
+    rng = np.random.default_rng(SEED)
     rows = []
-    skipped = []
+    eligible_flights = 0
+    skipped_flights = 0
+    window = 2 * CONTEXT_LENGTH + GAP_LENGTH
 
-    for i, f in enumerate(track_files, 1):
-        try:
-            result, reason = evaluate_one_flight(f)
-            if result is None:
-                skipped.append((f.name, reason))
-                print(f"  [{i:2d}] {f.name:40s}  SKIP: {reason}")
-                continue
-            rows.append(result)
-            print(f"  [{i:2d}] {f.name:40s}  "
-                  f"baseline={result['baseline_median']:6.2f}  "
-                  f"smoother={result['smoother_median']:6.2f}  "
-                  f"kalman={result['kalman_median']:6.2f} km")
-        except Exception as e:
-            skipped.append((f.name, f"ERROR: {e}"))
-            print(f"  [{i:2d}] {f.name:40s}  ERROR: {e}")
+    track_files = sorted(TRACKS_DIR.glob("*.parquet"))
+    print(f"Found {len(track_files)} track files")
+    print(f"Gap setup: {CONTEXT_LENGTH} before + {GAP_LENGTH} hidden + {CONTEXT_LENGTH} after")
 
-    print(f"\nEvaluated: {len(rows)} flights")
-    print(f"Skipped:   {len(skipped)} flights")
+    for path in track_files:
+        track = load_track(path)
+        if track is None:
+            skipped_flights += 1
+            continue
+
+        eligible_flights += 1
+        positions, altitudes, times = track
+        starts = rng.integers(0, len(positions) - window + 1, size=GAPS_PER_FLIGHT)
+
+        for start in starts:
+            rows.append(evaluate_window(model, path, positions, altitudes, times, int(start)))
+
+        if eligible_flights % 100 == 0:
+            print(f"  evaluated {eligible_flights} eligible flights...")
+
+    print(f"\nEligible flights: {eligible_flights}")
+    print(f"Skipped flights:  {skipped_flights}")
+    print(f"Gap samples:      {len(rows)}")
+
     if not rows:
-        print("\nNo flights successfully evaluated. Cannot compute summary.")
+        print("No eligible windows found.")
         return
 
-    # ---------- Summary across all flights ----------
-    df_results = pd.DataFrame(rows)
+    results = pd.DataFrame(rows)
+    methods = ["lstm", "great_circle", "linear"]
 
-    print("\n" + "=" * 70)
-    print("SUMMARY ACROSS ALL EVALUATED FLIGHTS")
-    print("=" * 70)
-    print(f"Number of flights: {len(df_results)}")
-    print(f"Gap duration: {GAP_DURATION_SEC // 60} minutes\n")
+    print("\n" + "=" * 76)
+    print("LSTM GAP-FILLING EVALUATION")
+    print("=" * 76)
+    print(f"{'Method':<14} {'mean':>10} {'median':>10} {'p95':>10} {'med path err':>14}")
+    print("-" * 76)
 
-    print(f"{'Method':<12} {'mean median':>12} {'med median':>12} {'mean p95':>12} {'med path err':>14}")
-    print("-" * 64)
+    for method in methods:
+        print(
+            f"{method:<14} "
+            f"{results[f'{method}_mean_error_km'].mean():>8.3f} km  "
+            f"{results[f'{method}_mean_error_km'].median():>8.3f} km  "
+            f"{results[f'{method}_p95_error_km'].mean():>8.3f} km  "
+            f"{results[f'{method}_path_error_km'].abs().median():>11.3f} km"
+        )
 
-    for method in ["baseline", "smoother", "kalman"]:
-        col_med = f"{method}_median"
-        col_p95 = f"{method}_p95"
-        col_pe  = f"{method}_path_err"
-        if col_med not in df_results.columns:
-            continue
-        print(f"{method:<12} "
-              f"{df_results[col_med].mean():>9.2f} km  "
-              f"{df_results[col_med].median():>9.2f} km  "
-              f"{df_results[col_p95].mean():>9.2f} km  "
-              f"{df_results[col_pe].abs().median():>11.2f} km")
+    win_cols = [f"{method}_mean_error_km" for method in methods]
+    wins = results[win_cols].idxmin(axis=1).str.replace("_mean_error_km", "")
+    print("\nWin counts (lowest mean error per hidden gap):")
+    for method in methods:
+        print(f"  {method:<14} {int((wins == method).sum())} of {len(results)}")
 
-    # How often does each method WIN (lowest median error)?
-    print("\nWin counts (lowest median error per flight):")
-    for method in ["baseline", "smoother", "kalman"]:
-        col = f"{method}_median"
-        if col not in df_results.columns:
-            continue
-        # Compare to all other available methods on each row
-        other_cols = [f"{m}_median" for m in ["baseline", "smoother", "kalman"]
-                      if f"{m}_median" in df_results.columns and m != method]
-        wins = (df_results[col] < df_results[other_cols].min(axis=1)).sum()
-        print(f"  {method:<12} won on {wins:2d} of {len(df_results)} flights")
+    baseline = results["great_circle_mean_error_km"].mean()
+    lstm = results["lstm_mean_error_km"].mean()
+    if baseline > 0:
+        gain = (baseline - lstm) / baseline * 100
+        print(f"\nLSTM vs great-circle baseline: {gain:+.1f}%")
 
-    # ---------- Save CSV ----------
-    csv_path = Path("evaluation_results.csv")
-    df_results.to_csv(csv_path, index=False)
-    print(f"\nFull per-flight results saved to {csv_path}")
+    results.to_csv(OUTPUT_CSV, index=False)
+    print(f"\nSaved per-gap results to {OUTPUT_CSV}")
 
 
 if __name__ == "__main__":
