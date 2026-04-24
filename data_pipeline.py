@@ -1,14 +1,5 @@
 """Ingest flight trajectories from the OpenSky Trino historical database.
 
-One query per day-partition (the `day` partition column in `flights_data4`),
-filtered to the configured airports, with the embedded `track` column unnested
-to per-point rows. Output schema is compatible with the downstream trainers
-(baseline.py, model.py, train_lstm.py).
-
-Flights are split deterministically into train / test directories via a CRC32
-hash on (icao24, firstseen) so the same flight always lands in the same split
-across runs.
-
 Read RULES.MD before changing this file — ignoring OpenSky's efficient-use
 guidelines gets the account banned.
 """
@@ -65,7 +56,6 @@ def day_partitions(days: int) -> Iterable[int]:
 
 
 def fetch_day(trino: Trino, day: int, airports: list[str]) -> pd.DataFrame:
-    """One partitioned query per day: flights + unnested trajectories."""
     airport_list = ",".join(f"'{a.upper()}'" for a in airports)
     sql = f"""
     SELECT f.icao24, f.firstseen, f.lastseen,

@@ -1,11 +1,4 @@
-"""
-Phase 5: Evaluate the trained LSTM trajectory gap-filler.
-
-This hides fixed-length trajectory windows, reconstructs them with the LSTM,
-and compares against interpolation baselines. Runs on data/clean/test_tracks/
-— the held-out split the pipeline reserved, so the model never saw these
-flights during training. This is the evaluation to use for the project report.
-"""
+"""Evaluate the trained LSTM gap-filler on held-out test tracks."""
 
 from pathlib import Path
 

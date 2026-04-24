@@ -1,9 +1,7 @@
-"""
-Train the bidirectional LSTM trajectory gap-filler on OpenSky ADS-B flights.
+"""Train the bidirectional LSTM trajectory gap-filler on OpenSky ADS-B flights.
 
-Loads parquet trajectories from data/clean/tracks/ for training (split 80/20
-into train/val by flight), then benchmarks the final model on the held-out
-data/clean/test_tracks/ flights which were never seen during training.
+Trains on data/clean/tracks/ (split 80/20 into train/val), then benchmarks on
+the held-out data/clean/test_tracks/ flights which were never seen during training.
 """
 
 import argparse
@@ -55,7 +53,6 @@ def parse_args() -> argparse.Namespace:
 
 
 def configure_runtime(args: argparse.Namespace) -> None:
-    """Apply TensorFlow runtime settings before model creation."""
     if tf is None:
         return
 
@@ -72,7 +69,6 @@ def configure_runtime(args: argparse.Namespace) -> None:
 
 
 def describe_runtime(args: argparse.Namespace) -> None:
-    """Print the TensorFlow runtime/device setup before training starts."""
     print(f"[0] Python {platform.python_version()} on {platform.system()}")
 
     if tf is None:
@@ -127,7 +123,6 @@ def great_circle_km(lat1, lon1, lat2, lon2):
 def evaluate_on_gaps(model: LSTMTrajectoryModel,
                      trajectories: List[Tuple[np.ndarray, np.ndarray, np.ndarray]],
                      gaps_per_flight: int = 15):
-    """Sample multiple gap positions from each held-out flight."""
     rng = np.random.default_rng(SEED)
     lstm_errs, great_circle_errs, linear_errs = [], [], []
     window = 2 * CONTEXT_LENGTH + GAP_LENGTH
@@ -147,14 +142,12 @@ def evaluate_on_gaps(model: LSTMTrajectoryModel,
 
         truth = positions[gap_slc]
 
-        # LSTM reconstruction (uses both before and after context)
         lstm_lat, lstm_lon, _ = model.predict_gap(
             positions[before_slc], altitudes[before_slc], times[before_slc],
             positions[after_slc], altitudes[after_slc], times[after_slc],
         )
         lstm_errs.append(np.mean(great_circle_km(truth[:, 0], truth[:, 1], lstm_lat, lstm_lon)))
 
-        # Great-circle baseline: interpolate between the two known endpoints of the gap
         p_before = positions[start + CONTEXT_LENGTH - 1]
         p_after = positions[start + CONTEXT_LENGTH + GAP_LENGTH]
         gc = np.array([
@@ -164,7 +157,6 @@ def evaluate_on_gaps(model: LSTMTrajectoryModel,
         ])
         great_circle_errs.append(np.mean(great_circle_km(truth[:, 0], truth[:, 1], gc[:, 0], gc[:, 1])))
 
-        # Linear lat/lon interpolation — what "naive interpolation" in the project PDF means
         frac = np.linspace(1 / (GAP_LENGTH + 1), GAP_LENGTH / (GAP_LENGTH + 1), GAP_LENGTH)
         lin_lat = p_before[0] + (p_after[0] - p_before[0]) * frac
         lin_lon = p_before[1] + (p_after[1] - p_before[1]) * frac

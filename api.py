@@ -1,16 +1,7 @@
-"""
-Step 7: FastAPI service for aircraft trajectory reconstruction.
+"""FastAPI service for aircraft trajectory reconstruction.
 
-Endpoints:
-  GET  /health                  - health check + model status
-  GET  /flights                 - list available flight IDs from local parquet files
-  GET  /opensky/flights         - list live OpenSky flights in a map area
-  GET  /opensky/reconstruct/... - reconstruct a live OpenSky track
-  GET  /reconstruct/{flight_id} - reconstruct a stored flight (icao24_firstSeen)
-  POST /reconstruct             - reconstruct from raw track points
-
-Gap-filling uses the trained LSTM model (12.8% better than great-circle baseline).
-Falls back to great-circle interpolation when LSTM context requirements can't be met.
+Gap-filling uses the trained LSTM model, falling back to great-circle
+interpolation when LSTM context requirements can't be met.
 """
 
 from __future__ import annotations
@@ -29,9 +20,6 @@ from baseline import interpolate_great_circle
 from model import LSTMTrajectoryModel, great_circle_km
 from opensky_client import OpenSkyClient, OpenSkyError, OpenSkyHTTPError
 
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
 
 TRACKS_DIR = Path("data/clean/tracks")
 WEIGHTS_PATH = Path("weights/lstm_residual_trajectory.keras")
@@ -39,9 +27,6 @@ CONTEXT_LENGTH = 20
 GAP_LENGTH = 10
 GAP_THRESHOLD_SECONDS = 120  # time gap larger than this triggers gap-filling
 
-# ---------------------------------------------------------------------------
-# Startup: load LSTM model once
-# ---------------------------------------------------------------------------
 
 _model: Optional[LSTMTrajectoryModel] = None
 _opensky = OpenSkyClient()
@@ -70,10 +55,6 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan,
 )
-
-# ---------------------------------------------------------------------------
-# Pydantic schemas
-# ---------------------------------------------------------------------------
 
 
 class TrackPoint(BaseModel):
@@ -146,11 +127,6 @@ class OpenSkyFlightsResponse(BaseModel):
     flights: List[OpenSkyFlight]
 
 
-# ---------------------------------------------------------------------------
-# Core gap-filling logic
-# ---------------------------------------------------------------------------
-
-
 def _great_circle_fill(p_before: np.ndarray, alt_before: float,
                        p_after: np.ndarray, alt_after: float,
                        gap_times: np.ndarray) -> List[ReconstructedPoint]:
@@ -173,7 +149,6 @@ def _great_circle_fill(p_before: np.ndarray, alt_before: float,
 
 def _lstm_fill(positions: np.ndarray, altitudes: np.ndarray, times: np.ndarray,
                gap_start_idx: int) -> Optional[List[ReconstructedPoint]]:
-    """Fill GAP_LENGTH points starting at gap_start_idx using the LSTM."""
     if _model is None:
         return None
 
@@ -222,7 +197,6 @@ def reconstruct_track(
     flight_id: str,
     icao24: str,
 ) -> ReconstructionResponse:
-    """Detect gaps and fill them. Returns the full reconstructed track."""
     order = np.argsort(times)
     positions, altitudes, times = positions[order], altitudes[order], times[order]
 
@@ -248,12 +222,9 @@ def reconstruct_track(
 
         gaps_found += 1
 
-        # Try LSTM first; it needs CONTEXT_LENGTH points on each side
-        # At this point `i+1` is the after-side start in the original array
         filled = _lstm_fill(positions, altitudes, times, gap_start_idx=i + 1)
 
         if filled is None:
-            # Fall back to great-circle with GAP_LENGTH fill points
             gap_times = np.linspace(float(times[i]), float(times[i + 1]), GAP_LENGTH + 2)[1:-1]
             filled = _great_circle_fill(
                 positions[i], float(altitudes[i]),
@@ -277,11 +248,6 @@ def reconstruct_track(
         gaps_filled=gaps_filled,
         track=result,
     )
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 
 
 def _load_parquet(path: Path):
@@ -338,10 +304,6 @@ def _raise_from_opensky(exc: OpenSkyError):
     raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
-# ---------------------------------------------------------------------------
-# Routes
-# ---------------------------------------------------------------------------
-
 _TEMPLATES = Path(__file__).parent / "templates"
 
 
@@ -364,7 +326,6 @@ def health():
 
 @app.get("/flights", response_model=List[str])
 def list_flights():
-    """Return all available flight IDs (parquet file stems)."""
     if not TRACKS_DIR.exists():
         raise HTTPException(status_code=404, detail=f"Tracks directory not found: {TRACKS_DIR}")
     return sorted(p.stem for p in TRACKS_DIR.glob("*.parquet"))
@@ -379,7 +340,6 @@ def list_opensky_flights(
     lomin: Optional[float] = None,
     lomax: Optional[float] = None,
 ):
-    """List live OpenSky flights, optionally filtered to the current map bounds."""
     if any(value is None for value in (lamin, lamax, lomin, lomax)) and any(
         value is not None for value in (lamin, lamax, lomin, lomax)
     ):
@@ -409,12 +369,6 @@ def list_opensky_flights(
 
 @app.get("/reconstruct/{flight_id}", response_model=ReconstructionResponse)
 def reconstruct_flight(flight_id: str):
-    """
-    Reconstruct a stored flight by its ID (e.g. `a1b2c3_1678900000`).
-
-    The ID matches the parquet filename stem under data/clean/tracks/.
-    Gaps longer than {GAP_THRESHOLD_SECONDS}s are filled with LSTM (or great-circle fallback).
-    """
     path = TRACKS_DIR / f"{flight_id}.parquet"
     if not path.exists():
         raise HTTPException(status_code=404, detail=f"Flight not found: {flight_id}")
@@ -428,12 +382,6 @@ def reconstruct_flight(flight_id: str):
 
 @app.get("/opensky/reconstruct/{icao24}", response_model=ReconstructionResponse)
 def reconstruct_opensky_flight(icao24: str, time: int = 0):
-    """
-    Reconstruct a track fetched live from OpenSky instead of from the local parquet folder.
-
-    `time=0` asks OpenSky for the live track. Passing `last_contact` from `/opensky/flights`
-    is often a little more robust when selecting a current aircraft from the list.
-    """
     try:
         positions, altitudes, times, track_icao24, callsign = _load_opensky_track(icao24, time)
     except OpenSkyError as exc:
@@ -448,12 +396,6 @@ def reconstruct_opensky_flight(icao24: str, time: int = 0):
 
 @app.post("/reconstruct", response_model=ReconstructionResponse)
 def reconstruct_raw(body: RawTrackRequest):
-    """
-    Reconstruct a trajectory from raw track points.
-
-    Send a list of {time, latitude, longitude, altitude_m} points.
-    Returns the same points with LSTM-filled (or great-circle-filled) gap segments inserted.
-    """
     if len(body.points) < 2:
         raise HTTPException(status_code=422, detail="At least 2 track points required.")
 
@@ -465,22 +407,11 @@ def reconstruct_raw(body: RawTrackRequest):
     return reconstruct_track(positions, altitudes, times, body.flight_id, icao24)
 
 
-# ---------------------------------------------------------------------------
-# Demo / comparison endpoint
-# ---------------------------------------------------------------------------
-
-_N_DEMO_GAPS = 10  # evenly-spaced gap positions exposed per flight
+_N_DEMO_GAPS = 10
 
 
 @app.get("/demo/{flight_id}", response_model=DemoResponse)
 def demo_gap(flight_id: str, gap: int = 0):
-    """
-    Artificially hide GAP_LENGTH points from a dense flight and compare
-    LSTM reconstruction vs great-circle baseline against the ground truth.
-
-    Use `?gap=0..9` to browse up to 10 evenly-spaced positions along the flight.
-    Requires the flight to have at least 2*CONTEXT_LENGTH + GAP_LENGTH points.
-    """
     path = TRACKS_DIR / f"{flight_id}.parquet"
     if not path.exists():
         raise HTTPException(status_code=404, detail=f"Flight not found: {flight_id}")
@@ -493,10 +424,9 @@ def demo_gap(flight_id: str, gap: int = 0):
     if len(positions) < window:
         raise HTTPException(
             status_code=422,
-            detail=f"Flight has only {len(positions)} points; need ≥ {window} for comparison demo.",
+            detail=f"Flight has only {len(positions)} points; need >= {window} for comparison demo.",
         )
 
-    # Evenly space up to _N_DEMO_GAPS positions across the valid range
     max_start = len(positions) - window
     n_gaps = min(_N_DEMO_GAPS, max_start + 1)
     starts = [int(round(max_start * i / max(n_gaps - 1, 1))) for i in range(n_gaps)]
@@ -525,10 +455,8 @@ def demo_gap(flight_id: str, gap: int = 0):
             source=src,  # type: ignore[arg-type]
         )
 
-    # Full track (gap marked as original so UI draws it as background)
     full_track = [_pt(i, "original") for i in range(len(positions))]
 
-    # Ground truth
     truth = [
         ComparisonPoint(
             time=float(gap_times[i]), latitude=float(gap_pos[i, 0]),
@@ -537,7 +465,6 @@ def demo_gap(flight_id: str, gap: int = 0):
         for i in range(GAP_LENGTH)
     ]
 
-    # LSTM reconstruction
     lstm_fill: Optional[List[ComparisonPoint]] = None
     lstm_error: Optional[float] = None
     if _model is not None:
@@ -558,7 +485,6 @@ def demo_gap(flight_id: str, gap: int = 0):
         except Exception:
             pass
 
-    # Great-circle reconstruction
     fractions = np.linspace(1 / (GAP_LENGTH + 1), GAP_LENGTH / (GAP_LENGTH + 1), GAP_LENGTH)
     gc_lats = np.array([
         interpolate_great_circle(

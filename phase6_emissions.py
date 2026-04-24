@@ -1,10 +1,4 @@
-"""
-Phase 6: Distance and emissions sensitivity from LSTM-reconstructed tracks.
-
-This uses the trained LSTM gap-filler as the project reconstruction model,
-then compares downstream route-distance and CO2 proxy errors against simple
-interpolation baselines.
-"""
+"""Distance and emissions sensitivity from LSTM-reconstructed tracks."""
 
 from pathlib import Path
 
@@ -22,8 +16,7 @@ OUTPUT_CSV = Path("phase6_emissions_results.csv")
 CONTEXT_LENGTH = 20
 GAP_LENGTH = 10
 
-# Simple emissions proxy:
-# 3.0 kg fuel per km and 3.16 kg CO2 per kg fuel.
+# Emissions proxy: 3.0 kg fuel per km, 3.16 kg CO2 per kg fuel.
 FUEL_KG_PER_KM = 3.0
 CO2_KG_PER_FUEL_KG = 3.16
 CO2_KG_PER_KM = FUEL_KG_PER_KM * CO2_KG_PER_FUEL_KG
@@ -180,7 +173,7 @@ def main():
     results = pd.DataFrame(rows)
 
     print("\n" + "=" * 76)
-    print("PHASE 6 SUMMARY: LSTM DISTANCE AND EMISSIONS SENSITIVITY")
+    print("LSTM DISTANCE AND EMISSIONS SENSITIVITY")
     print("=" * 76)
 
     for scope in ["gap", "full"]:

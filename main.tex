@@ -1,0 +1,639 @@
+\documentclass[11pt]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath, amssymb}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{array}
+\usepackage{enumitem}
+\usepackage{siunitx}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{listings}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!60!black,
+  urlcolor=blue!60!black,
+  citecolor=blue!60!black
+}
+
+\lstdefinestyle{repo}{
+  basicstyle=\ttfamily\small,
+  breaklines=true,
+  frame=single,
+  columns=fullflexible,
+  keepspaces=true,
+  showstringspaces=false
+}
+
+\title{Aircraft Trajectory Reconstruction: End-to-End Project Documentation}
+\author{Repository Documentation Generated from the Current Codebase}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+This document provides a complete technical description of the aircraft trajectory reconstruction project implemented in this repository. It covers historical data ingestion from OpenSky, trajectory cleaning and deterministic train/test splitting, the great-circle and linear interpolation baselines, the constant-velocity Kalman filter and Rauch--Tung--Striebel smoother, the residual bidirectional LSTM gap-filling model, the training and evaluation pipelines, the emissions sensitivity analysis, and the FastAPI plus browser demo layer. The document is intentionally written as a single Overleaf-compatible \texttt{main.tex} file using standard packages only, so it can be uploaded and compiled directly on Overleaf with pdf\LaTeX{}.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+\section{Project Overview}
+The repository implements an end-to-end workflow for reconstructing missing segments in aircraft trajectories. The main idea is to start from ADS-B/ADS-C flight tracks, remove noisy or irrelevant samples, train a model on complete trajectory windows, and then use the trained model to fill missing points in real or simulated gaps.
+
+The codebase is organized around five major stages:
+\begin{enumerate}[leftmargin=1.5em]
+  \item Historical data ingestion from the OpenSky Trino database.
+  \item Trajectory cleaning and deterministic train/test splitting into parquet files.
+  \item Model development, including interpolation baselines, Kalman methods, and a residual bidirectional LSTM.
+  \item Quantitative evaluation on held-out trajectories and a downstream emissions sensitivity study.
+  \item A FastAPI service with a web demo for local and live OpenSky reconstructions.
+\end{enumerate}
+
+At the time of writing, the current workspace contains:
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{7215} training-track parquet files under \texttt{data/clean/tracks}
+  \item \textbf{1808} held-out test-track parquet files under \texttt{data/clean/test\_tracks}
+  \item a checked-in held-out evaluation summary in \texttt{evaluation\_results.csv}
+\end{itemize}
+
+\section{Repository Layout}
+Table~\ref{tab:repo-layout} summarizes the main project files.
+
+\begin{longtable}{>{\raggedright\arraybackslash}p{0.28\textwidth} >{\raggedright\arraybackslash}p{0.64\textwidth}}
+\caption{Core repository files and responsibilities}\label{tab:repo-layout}\\
+\toprule
+\textbf{File} & \textbf{Purpose} \\
+\midrule
+\endfirsthead
+\toprule
+\textbf{File} & \textbf{Purpose} \\
+\midrule
+\endhead
+\texttt{data\_pipeline.py} & Queries OpenSky historical data via Trino, unnests track points, cleans trajectories, and writes deterministic train/test parquet splits. \\
+\texttt{baseline.py} & Implements great-circle distance, spherical interpolation, altitude interpolation, and a generic gap-filling baseline. \\
+\texttt{model.py} & Contains the constant-velocity Kalman filter, RTS smoother, residual BiLSTM model, and a wrapper fusion interface. \\
+\texttt{train\_lstm.py} & Trains the residual BiLSTM, prepares windows, configures the TensorFlow runtime, and benchmarks validation/test gaps. \\
+\texttt{evaluate.py} & Older qualitative evaluation script that hides one long gap and compares the great-circle baseline with Kalman methods. \\
+\texttt{evaluate\_all.py} & Main held-out evaluation script used for report-style summary metrics over many random test gaps. \\
+\texttt{phase6\_emissions.py} & Computes route-distance and CO\(_2\) proxy errors induced by gap reconstruction. \\
+\texttt{api.py} & FastAPI service exposing health, local-flight listing, reconstruction, comparison demo, and OpenSky-backed live reconstruction. \\
+\texttt{opensky\_client.py} & Small OpenSky REST client with OAuth client-credentials support and token caching. \\
+\texttt{templates/index.html} & Browser UI for 2D/3D visualization, comparison, local reconstruction, and live OpenSky selection. \\
+\texttt{weights/lstm\_residual\_trajectory.keras} & Main trained residual BiLSTM weights used by the service and evaluation scripts. \\
+\texttt{evaluation\_results.csv} & Saved output from the official held-out evaluation script. \\
+\bottomrule
+\end{longtable}
+
+\section{Environment and Dependencies}
+The Python dependencies are intentionally lightweight except for the optional machine learning stack. The repository requires:
+\begin{itemize}[leftmargin=1.5em]
+  \item \texttt{requests}, \texttt{pandas}, \texttt{pyarrow}, \texttt{fastparquet}, and \texttt{python-dotenv} for data and I/O
+  \item \texttt{numpy}, \texttt{scipy}, and \texttt{scikit-learn} for scientific computing
+  \item \texttt{tensorflow} and \texttt{keras} for the LSTM model
+  \item \texttt{fastapi} and \texttt{uvicorn} for the web service
+\end{itemize}
+
+The training script explicitly notes a platform caveat: native Windows TensorFlow versions newer than 2.11 do not use NVIDIA CUDA GPUs, so the code recommends WSL2 for GPU acceleration. When a GPU is available, the training script enables memory growth and can turn on mixed precision.
+
+\section{Historical Data Pipeline}
+\subsection{Source System}
+The ingestion entrypoint is \texttt{data\_pipeline.py}. Historical trajectories are obtained from OpenSky's Trino-backed table \texttt{flights\_data4}. Each query is performed against a single OpenSky day partition, and the nested \texttt{track} array is unnested into point-level rows.
+
+The default airport filter is: \texttt{EDDF}, \texttt{EGLL}, \texttt{LFPG}, \texttt{EHAM}, \texttt{LEMD}, \texttt{LIRF}, \texttt{LOWW}, \texttt{LSZH}, \texttt{EKCH}, and \texttt{EDDM}.
+
+At a high level, the SQL performed by the pipeline is:
+\begin{lstlisting}[style=repo]
+SELECT f.icao24, f.firstseen, f.lastseen,
+       f.estdepartureairport, f.estarrivalairport, f.callsign,
+       tp_time, tp_lat, tp_lon, tp_alt, tp_heading, tp_onground
+FROM flights_data4 f
+CROSS JOIN UNNEST(f.track) AS t(
+    tp_time, tp_lat, tp_lon, tp_alt, tp_heading, tp_onground
+)
+WHERE f.day = <partition>
+  AND (
+      f.estdepartureairport IN (<airport list>)
+      OR f.estarrivalairport IN (<airport list>)
+  );
+\end{lstlisting}
+
+\subsection{Daily Partitioning}
+The helper \texttt{day\_partitions(days)} generates UTC-midnight timestamps for the previous \(N\) full UTC days, excluding the current day. This keeps data retrieval aligned with OpenSky's day partition structure and avoids partial-day inconsistencies.
+
+\subsection{Track Cleaning}
+Each grouped flight trajectory is processed by \texttt{clean\_track(df)}:
+\begin{enumerate}[leftmargin=1.5em]
+  \item sort by timestamp
+  \item drop duplicate timestamps
+  \item remove points with missing latitude, longitude, or barometric altitude
+  \item interpret \texttt{on\_ground} as a nullable boolean and fill missing values with \texttt{False}
+  \item remove points with altitude at or above \SI{15000}{\metre}
+  \item remove points flagged as on-ground
+\end{enumerate}
+
+This cleaning stage is designed to keep airborne trajectory segments only and to remove sparse or corrupted records before model training.
+
+\subsection{Deterministic Train/Test Split}
+The pipeline does not randomly reshuffle flights every run. Instead, it hashes the string key \texttt{icao24|firstseen} using CRC32 and routes each flight to train or test deterministically. If \(h_f\) denotes that hash for flight \(f\), then:
+\[
+\text{test}(f)=
+\begin{cases}
+1, & \text{if } h_f \bmod 100 < 100r\\
+0, & \text{otherwise}
+\end{cases}
+\]
+where \(r\) is the configured test ratio.
+
+This is an important design choice: the same flight always lands in the same split across repeated runs, so evaluation is reproducible at the flight level.
+
+\subsection{Stored Output Format}
+Each cleaned trajectory is saved to a parquet file named \texttt{<icao24>\_<firstseen>.parquet}
+and contains at least the following columns:
+\begin{itemize}[leftmargin=1.5em]
+  \item \texttt{time}
+  \item \texttt{latitude}
+  \item \texttt{longitude}
+  \item \texttt{baro\_altitude}
+  \item \texttt{true\_track}
+  \item \texttt{on\_ground}
+  \item \texttt{icao24}
+  \item \texttt{callsign}
+  \item \texttt{flight\_start}
+  \item \texttt{flight\_end}
+\end{itemize}
+
+\section{Geometric and Physical Foundations}
+\subsection{Great-Circle Distance}
+The repository consistently measures geographic point-to-point error with the haversine great-circle distance. For latitudes and longitudes in radians:
+\begin{align}
+\Delta \phi &= \phi_2 - \phi_1, \\
+\Delta \lambda &= \lambda_2 - \lambda_1, \\
+a &= \sin^2\!\left(\frac{\Delta \phi}{2}\right)
+  + \cos(\phi_1)\cos(\phi_2)\sin^2\!\left(\frac{\Delta \lambda}{2}\right), \\
+d_{\text{gc}} &= 2R \arctan2(\sqrt{a}, \sqrt{1-a}),
+\end{align}
+with Earth radius \(R = \SI{6371}{\kilo\metre}\).
+
+This formula appears in both \texttt{baseline.py} and \texttt{model.py}, and it is the core error measure used throughout evaluation.
+
+\subsection{Great-Circle Interpolation}
+Given two spherical endpoints and an interpolation fraction \(f \in [0,1]\), the baseline computes an intermediate point using spherical linear interpolation:
+\begin{align}
+\delta &= d_{\text{gc}} / R, \\
+A &= \frac{\sin((1-f)\delta)}{\sin(\delta)}, \\
+B &= \frac{\sin(f\delta)}{\sin(\delta)}.
+\end{align}
+The corresponding Cartesian coordinates are:
+\begin{align}
+x &= A\cos\phi_1\cos\lambda_1 + B\cos\phi_2\cos\lambda_2, \\
+y &= A\cos\phi_1\sin\lambda_1 + B\cos\phi_2\sin\lambda_2, \\
+z &= A\sin\phi_1 + B\sin\phi_2.
+\end{align}
+The interpolated latitude and longitude are then:
+\begin{align}
+\phi &= \arctan2\!\left(z, \sqrt{x^2+y^2}\right), \\
+\lambda &= \arctan2(y,x).
+\end{align}
+
+Altitude is interpolated linearly:
+\[
+\hat{h}(f) = h_1 + f(h_2-h_1).
+\]
+
+\subsection{Constant-Velocity Kalman Filter}
+The filter state is:
+\[
+\mathbf{x}_t =
+\begin{bmatrix}
+\text{lat}_t & \text{lon}_t & \text{alt}_t & v^{\text{lat}}_t & v^{\text{lon}}_t & v^{\text{alt}}_t
+\end{bmatrix}^{\top}.
+\]
+
+For time step \(\Delta t\), the transition matrix is:
+\[
+\mathbf{F}(\Delta t)=
+\begin{bmatrix}
+1&0&0&\Delta t&0&0\\
+0&1&0&0&\Delta t&0\\
+0&0&1&0&0&\Delta t\\
+0&0&0&1&0&0\\
+0&0&0&0&1&0\\
+0&0&0&0&0&1
+\end{bmatrix}.
+\]
+
+The filter uses standard predict/update equations:
+\begin{align}
+\mathbf{x}_{t|t-1} &= \mathbf{F}\mathbf{x}_{t-1|t-1}, \\
+\mathbf{P}_{t|t-1} &= \mathbf{F}\mathbf{P}_{t-1|t-1}\mathbf{F}^{\top} + \mathbf{Q}, \\
+\mathbf{y}_t &= \mathbf{z}_t - \mathbf{H}\mathbf{x}_{t|t-1}, \\
+\mathbf{S}_t &= \mathbf{H}\mathbf{P}_{t|t-1}\mathbf{H}^{\top} + \mathbf{R}, \\
+\mathbf{K}_t &= \mathbf{P}_{t|t-1}\mathbf{H}^{\top}\mathbf{S}_t^{-1}, \\
+\mathbf{x}_{t|t} &= \mathbf{x}_{t|t-1} + \mathbf{K}_t\mathbf{y}_t, \\
+\mathbf{P}_{t|t} &= (\mathbf{I} - \mathbf{K}_t\mathbf{H})\mathbf{P}_{t|t-1}.
+\end{align}
+
+Only position is measured directly, so \(\mathbf{H}\) extracts the position part of the state. Gap points are handled by prediction-only steps: if a point is unobserved, no measurement update is applied.
+
+\subsection{RTS Smoother}
+The smoother in \texttt{model.py} performs a forward Kalman pass followed by a backward Rauch--Tung--Striebel pass. If \(\mathbf{x}_{t|T}\) is the smoothed estimate and \(\mathbf{x}_{t|t}\) is the filtered estimate, the smoothing gain is:
+\[
+\mathbf{D}_t = \mathbf{P}_{t|t}\mathbf{F}^{\top}
+\left(\mathbf{F}\mathbf{P}_{t|t}\mathbf{F}^{\top} + \mathbf{Q}\right)^{-1},
+\]
+and the smoothed state update is:
+\[
+\mathbf{x}_{t|T}
+=
+\mathbf{x}_{t|t}
+\mathbf{D}_t
+\left(
+\mathbf{x}_{t+1|T} - \mathbf{x}_{t+1|t}
+\right).
+\]
+
+This bidirectional processing is useful for gap reconstruction because it uses context from both sides of the missing segment.
+
+\section{Baseline and Classical Reconstruction Methods}
+\subsection{Great-Circle Baseline}
+The simplest baseline in this project connects the last known point before a gap to the first known point after a gap by a great-circle arc. It is intentionally strong: unlike naive Euclidean interpolation in latitude/longitude, it respects the geometry of the sphere.
+
+\subsection{Linear Latitude/Longitude Baseline}
+For comparison, the official evaluation also includes a purely linear baseline in latitude/longitude space:
+\[
+\hat{\mathbf{p}}_j = \mathbf{p}_{\text{before}} + \alpha_j \left(\mathbf{p}_{\text{after}} - \mathbf{p}_{\text{before}}\right),
+\quad
+\alpha_j = \frac{j}{G+1}, \quad j=1,\dots,G,
+\]
+where \(G\) is the number of hidden gap points.
+
+\subsection{Kalman Filter and Smoother}
+The classical alternatives are exposed through \texttt{FusionTrajectoryModel}. These methods are mainly used in the older visual comparison script \texttt{evaluate.py}, which hides a \SI{20}{\minute} middle segment from a held-out flight and compares:
+\begin{itemize}[leftmargin=1.5em]
+  \item the great-circle baseline,
+  \item the forward constant-velocity Kalman filter,
+  \item the RTS smoother.
+\end{itemize}
+
+This script is best viewed as a qualitative or legacy comparison stage. The repository's main quantitative LSTM evaluation is \texttt{evaluate\_all.py}.
+
+\section{Residual Bidirectional LSTM Model}
+\subsection{Why a Residual Formulation?}
+The BiLSTM does not predict absolute coordinates from scratch. Instead, it learns a residual correction on top of a linear interpolation baseline. This has two advantages:
+\begin{enumerate}[leftmargin=1.5em]
+  \item the network only needs to learn where simple interpolation is wrong
+  \item the zero-initialized output layer makes the initial prediction equal to the baseline
+\end{enumerate}
+
+\subsection{Context Window}
+The model expects:
+\begin{itemize}[leftmargin=1.5em]
+  \item \(C = 20\) points before the gap
+  \item \(G = 10\) hidden gap points to reconstruct
+  \item \(C = 20\) points after the gap
+\end{itemize}
+so the total context sequence length is:
+\[
+L = 2C = 40.
+\]
+
+\subsection{Feature Construction}
+Let the final point before the gap be the anchor \((\phi_a,\lambda_a,h_a,t_a)\). For every context point, the feature vector is:
+\[
+\mathbf{f}_i =
+\begin{bmatrix}
+10(\phi_i-\phi_a) \\
+10(\lambda_i-\lambda_a) \\
+(h_i-h_a)/10000 \\
+\Delta t_i/3600
+\end{bmatrix}.
+\]
+
+The time delta is computed between adjacent points within the before segment and within the after segment; for the first after-gap point, the previous time is the anchor time.
+
+In code, the corresponding constants are \texttt{POSITION\_SCALE = 10}, \texttt{ALTITUDE\_SCALE\_METERS = 10000}, and \texttt{TIME\_SCALE\_SECONDS = 3600}.
+
+\subsection{Residual Targets}
+The baseline gap trajectory is built by linearly interpolating between the last pre-gap point and first post-gap point in both position and altitude. Denote baseline position and altitude at hidden index \(j\) by \((\mathbf{b}^{p}_j, b^{h}_j)\), and denote the ground truth by \((\mathbf{g}^{p}_j, g^{h}_j)\). The residual target is:
+\[
+\mathbf{r}_j =
+\begin{bmatrix}
+10(g^{\phi}_j - b^{\phi}_j) \\
+10(g^{\lambda}_j - b^{\lambda}_j) \\
+(g^{h}_j - b^{h}_j)/10000
+\end{bmatrix}.
+\]
+
+At inference time, the model predicts \(\hat{\mathbf{r}}_j\), and the final reconstruction is:
+\[
+\hat{\mathbf{g}}_j =
+\begin{bmatrix}
+b^{\phi}_j + \hat{r}^{\phi}_j/10 \\
+b^{\lambda}_j + \hat{r}^{\lambda}_j/10 \\
+b^{h}_j + 10000\,\hat{r}^{h}_j
+\end{bmatrix}.
+\]
+
+\subsection{Network Architecture}
+The Keras model created by \texttt{create\_lstm\_model()} is:
+\begin{center}
+\begin{tabular}{ll}
+\toprule
+\textbf{Stage} & \textbf{Shape / Setting} \\
+\midrule
+Input & \((40, 4)\) \\
+BiLSTM & 64 units, return sequences \\
+Dropout & 0.2 \\
+BiLSTM & 32 units, final state only \\
+Dropout & 0.2 \\
+Dense & 64 units, ReLU \\
+Dense & \(10 \times 3 = 30\) outputs, zero kernel and bias init \\
+Reshape & \((10, 3)\) residual prediction \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The optimizer is Adam and the loss is Huber with \(\delta=1.0\). Mean absolute error is tracked as an auxiliary metric.
+
+\section{Training Procedure}
+\subsection{Trajectory Loading}
+\texttt{train\_lstm.py} loads cleaned parquet trajectories from:
+\begin{itemize}[leftmargin=1.5em]
+  \item \texttt{data/clean/tracks} for training and validation
+  \item \texttt{data/clean/test\_tracks} for held-out benchmarking
+\end{itemize}
+
+Any trajectory shorter than \(2C+G = 50\) points is skipped.
+
+\subsection{Train/Validation/Test Split}
+The split happens in two stages:
+\begin{enumerate}[leftmargin=1.5em]
+  \item \textbf{Pipeline stage:} deterministic train/test split at the flight level using CRC32 hashing.
+  \item \textbf{Training stage:} the training-flight set is randomly split 80/20 into train and validation trajectories using NumPy permutation with seed 42.
+\end{enumerate}
+
+\subsection{Window Sampling}
+For each eligible flight, sliding windows of length \(2C+G\) are extracted. The training script uses a default \texttt{window\_stride} of 4, so only every fourth valid window is used. This reduces overlap and keeps the number of windows manageable.
+
+\subsection{Runtime Configuration}
+The default hyperparameters are:
+\begin{itemize}[leftmargin=1.5em]
+  \item epochs: 50
+  \item batch size: 128
+  \item context length: 20
+  \item gap length: 10
+  \item window stride: 4
+  \item early stopping patience: 6
+  \item seed: 42
+\end{itemize}
+
+On GPU systems, the code can enable mixed precision and TensorFlow memory growth. Best model weights are restored via early stopping and saved to \texttt{weights/lstm\_residual\_trajectory.keras}.
+
+\section{Evaluation Methodology}
+\subsection{Official Held-Out Evaluation}
+The main report-quality evaluation is \texttt{evaluate\_all.py}. It:
+\begin{enumerate}[leftmargin=1.5em]
+  \item loads the held-out flight set from \texttt{data/clean/test\_tracks}
+  \item samples 3 random hidden windows per eligible flight with seed 42
+  \item reconstructs each hidden gap with the trained LSTM
+  \item compares against great-circle and linear baselines
+  \item writes per-gap outputs to \texttt{evaluation\_results.csv}
+\end{enumerate}
+
+For each gap and each method, the script computes:
+\begin{align}
+\text{mean error} &= \frac{1}{G}\sum_{j=1}^{G} d_{\text{gc}}(\mathbf{g}_j, \hat{\mathbf{g}}_j), \\
+\text{median error} &= \operatorname{median}\left(d_{\text{gc}}(\mathbf{g}_j, \hat{\mathbf{g}}_j)\right), \\
+\text{p95 error} &= \operatorname{percentile}_{95}\left(d_{\text{gc}}(\mathbf{g}_j, \hat{\mathbf{g}}_j)\right), \\
+\text{path error} &= \ell(\hat{\mathbf{g}}_{1:G}) - \ell(\mathbf{g}_{1:G}),
+\end{align}
+where \(\ell(\cdot)\) is the total great-circle path length along the hidden segment.
+
+\subsection{Current Saved Held-Out Results}
+The checked-in \texttt{evaluation\_results.csv} contains \textbf{5418} gap samples. Since the evaluation script uses 3 samples per eligible flight, this corresponds to \textbf{1806} eligible test flights and 2 skipped test flights in the current workspace.
+
+Table~\ref{tab:heldout-results} summarizes the current saved results.
+
+\begin{table}[h!]
+\centering
+\caption{Held-out reconstruction results from the checked-in \texttt{evaluation\_results.csv}}
+\label{tab:heldout-results}
+\begin{tabular}{lrrrrr}
+\toprule
+\textbf{Method} & \textbf{Mean} & \textbf{Median} & \textbf{Mean p95} & \textbf{Median $|$path err$|$} & \textbf{Wins} \\
+& \textbf{(km)} & \textbf{(km)} & \textbf{(km)} & \textbf{(km)} & \textbf{(of 5418)} \\
+\midrule
+LSTM & 18.113 & 2.213 & 44.226 & 1.293 & 2725 \\
+Great-circle & 22.485 & 2.939 & 40.702 & 1.330 & 1415 \\
+Linear & 22.780 & 2.948 & 41.091 & 1.329 & 1278 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Using the mean of per-gap mean error as the primary score, the current saved LSTM improves over the great-circle baseline by:
+\[
+\frac{22.485 - 18.113}{22.485}\times 100 \approx 19.44\%.
+\]
+
+An important nuance is visible in Table~\ref{tab:heldout-results}: the LSTM wins more often and lowers the average mean error substantially, but the average p95 error remains slightly worse than the great-circle baseline. This suggests the model improves typical cases while still producing a small number of hard outliers.
+
+\subsection{Visual Comparison Script}
+\texttt{evaluate.py} is a separate script that hides a \SI{20}{\minute} central segment from a held-out flight, reconstructs it using the great-circle baseline and Kalman methods, reports median/p95/max error, and saves a visualization as \texttt{phase5\_comparison.png}. This script is useful for figures and sanity checks, but it is not the primary aggregate benchmark for the LSTM.
+
+\section{Phase 6: Distance and Emissions Sensitivity}
+\texttt{phase6\_emissions.py} asks a downstream question: if the hidden trajectory is reconstructed incorrectly, how much route distance and emissions error does that induce?
+
+The script uses a simple emissions proxy:
+\[
+\text{fuel rate} = 3.0 \ \text{kg fuel/km},
+\qquad
+\text{CO}_2 = 3.16 \ \text{kg CO}_2/\text{kg fuel}.
+\]
+Therefore:
+\[
+\text{CO}_2\text{ per km} = 3.0 \times 3.16 = 9.48 \ \text{kg CO}_2/\text{km}.
+\]
+
+For each flight, the script:
+\begin{enumerate}[leftmargin=1.5em]
+  \item selects the center window of length \(2C+G\)
+  \item hides the middle \(G\) points
+  \item reconstructs the gap with the LSTM, great-circle baseline, and linear baseline
+  \item measures both the gap-only distance error and the full-flight distance error after replacing the hidden points
+  \item converts distance error to CO\(_2\) proxy error
+\end{enumerate}
+
+For a distance error \(\Delta d\), the CO\(_2\) proxy error is:
+\[
+\Delta \text{CO}_2 = 9.48 \, \Delta d.
+\]
+
+This phase is useful because a reconstruction model can look good geometrically while still biasing downstream operational quantities such as route distance.
+
+\section{Service Layer and Demo Application}
+\subsection{FastAPI Service}
+The application server is implemented in \texttt{api.py}. It loads the trained LSTM once at startup and falls back to the great-circle method when the model is unavailable or when a gap lacks enough context.
+
+The core local reconstruction policy is:
+\begin{enumerate}[leftmargin=1.5em]
+  \item scan the time-sorted track
+  \item treat any time jump larger than \texttt{GAP\_THRESHOLD\_SECONDS = 120} as a gap
+  \item try the LSTM if at least 20 points exist on both sides
+  \item otherwise fill the missing interval with 10 great-circle points
+\end{enumerate}
+
+\subsection{API Endpoints}
+Table~\ref{tab:api-endpoints} summarizes the main routes.
+
+\begin{table}[h!]
+\centering
+\caption{FastAPI endpoints}
+\label{tab:api-endpoints}
+\begin{tabular}{>{\ttfamily}p{0.38\textwidth} p{0.5\textwidth}}
+\toprule
+\textnormal{\textbf{Route}} & \textbf{Purpose} \\
+\midrule
+\textnormal{GET /health} & Service status, model status, and OpenSky auth status \\
+\textnormal{GET /flights} & Lists locally stored flight IDs \\
+\textnormal{GET /reconstruct/\{flight\_id\}} & Reconstructs a stored local parquet trajectory \\
+\textnormal{POST /reconstruct} & Reconstructs a user-supplied raw trajectory \\
+\textnormal{GET /demo/\{flight\_id\}?gap=n} & Hides a dense local segment and compares LSTM vs great-circle \\
+\textnormal{GET /opensky/flights} & Lists live OpenSky flights in the current map bounds \\
+\textnormal{GET /opensky/reconstruct/\{icao24\}?time=t} & Fetches a live OpenSky track and reconstructs it \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{OpenSky REST Integration}
+\texttt{opensky\_client.py} provides a small REST client with OAuth client-credentials support. It reads:
+\begin{itemize}[leftmargin=1.5em]
+  \item \texttt{OPENSKY\_CLIENT\_ID}
+  \item \texttt{OPENSKY\_CLIENT\_SECRET}
+\end{itemize}
+from the environment, requests access tokens, caches them with an expiry margin, and attaches them to REST calls.
+
+The important design decision is architectural: the browser never talks directly to the OpenSky API. Instead, the browser talks to FastAPI, and FastAPI proxies the OpenSky requests. This avoids exposing API credentials in client-side JavaScript.
+
+\subsection{Browser Demo}
+The UI in \texttt{templates/index.html} is a single-page application built with:
+\begin{itemize}[leftmargin=1.5em]
+  \item Leaflet for the 2D map
+  \item \texttt{globe.gl} / three-globe for 3D visualization
+\end{itemize}
+
+It provides two main tabs:
+\begin{enumerate}[leftmargin=1.5em]
+  \item \textbf{Reconstruct}: visualize actual gap filling on a local or live OpenSky track
+  \item \textbf{Compare Methods}: hide a dense segment and compare LSTM vs great-circle against the truth
+\end{enumerate}
+
+Additional demo features include:
+\begin{itemize}[leftmargin=1.5em]
+  \item 2D map and 3D globe toggle
+  \item altitude exaggeration in the globe view
+  \item downloadable reconstructed JSON
+  \item OpenSky live-flight loading based on current map bounds
+  \item per-gap comparison browsing over up to 10 evenly spaced hidden windows
+\end{itemize}
+
+The 3D globe uses an altitude exaggeration formula:
+\[
+\text{globe altitude} =
+\frac{\text{altitude\_m}}{1000}
+\cdot
+\frac{a_{\text{exag}}}{R_{\text{Earth}}},
+\]
+with \(R_{\text{Earth}} = 6371\) km and default \(a_{\text{exag}} = 40\).
+
+\section{How to Run the Project}
+\subsection{Data Ingestion}
+\begin{lstlisting}[style=repo]
+python data_pipeline.py --days 2 --clean --test-ratio 0.2
+\end{lstlisting}
+
+\subsection{Model Training}
+\begin{lstlisting}[style=repo]
+python train_lstm.py --epochs 50 --batch-size 128 --window-stride 4
+\end{lstlisting}
+
+\subsection{Official Held-Out Evaluation}
+\begin{lstlisting}[style=repo]
+python evaluate_all.py
+\end{lstlisting}
+
+\subsection{Kalman Comparison Figure}
+\begin{lstlisting}[style=repo]
+python evaluate.py
+\end{lstlisting}
+
+\subsection{Emissions Sensitivity}
+\begin{lstlisting}[style=repo]
+python phase6_emissions.py
+\end{lstlisting}
+
+\subsection{API and Demo}
+\begin{lstlisting}[style=repo]
+uvicorn api:app --reload
+\end{lstlisting}
+
+\section{Strengths, Caveats, and Extension Points}
+\subsection{Strengths}
+The repository has several strong engineering choices:
+\begin{itemize}[leftmargin=1.5em]
+  \item deterministic train/test splitting at the flight level
+  \item a strong spherical baseline, not just naive straight-line interpolation
+  \item a residual LSTM formulation that simplifies learning
+  \item explicit held-out evaluation on flights the model never saw during training
+  \item an integrated demo that exposes both local and live OpenSky trajectories
+\end{itemize}
+
+\subsection{Caveats}
+Important caveats include:
+\begin{itemize}[leftmargin=1.5em]
+  \item the model assumes a fixed context length (20) and fixed gap length (10)
+  \item the current LSTM improves the average mean error but still shows some heavy-tail outliers
+  \item the altitude cap and on-ground filtering are hand-crafted cleaning rules
+  \item native Windows TensorFlow may not use CUDA GPUs
+  \item several UI strings in the HTML file still show encoding artifacts, although this does not affect the mathematical or service logic
+\end{itemize}
+
+\subsection{Natural Extensions}
+Possible next extensions are:
+\begin{itemize}[leftmargin=1.5em]
+  \item variable-length gap prediction instead of fixed 10-point outputs
+  \item richer features such as heading, speed, or airport priors
+  \item probabilistic uncertainty estimates for reconstructed points
+  \item explicit handling of long gaps with hierarchical or multi-scale models
+  \item historical OpenSky flight search in the live demo, not just current state browsing
+\end{itemize}
+
+\section{Overleaf Usage}
+This file is already structured as a single Overleaf-compatible entrypoint:
+\begin{itemize}[leftmargin=1.5em]
+  \item filename: \texttt{main.tex}
+  \item no custom document class
+  \item no shell-escape requirement
+  \item no external bibliography file
+  \item only standard packages commonly available in Overleaf
+\end{itemize}
+
+To use it on Overleaf:
+\begin{enumerate}[leftmargin=1.5em]
+  \item upload the repository (or at least \texttt{main.tex}) to Overleaf
+  \item set \texttt{main.tex} as the main document if Overleaf does not choose it automatically
+  \item compile with pdf\LaTeX{}
+\end{enumerate}
+
+\section{Conclusion}
+This repository implements a complete aircraft trajectory reconstruction system, beginning with OpenSky historical ingestion and ending with an interactive browser demo. The core modeling idea is a residual bidirectional LSTM that learns corrections relative to a simple interpolation baseline, trained on fixed windows extracted from cleaned flight tracks. The project also keeps classical geometric and Kalman-based methods in the loop, which is valuable both for benchmarking and for understanding where the learned model helps most.
+
+From a systems perspective, the project is notable because it does not stop at model training: it includes deterministic data management, reproducible evaluation, downstream emissions analysis, a service API, and a visualization interface that can operate on both local stored flights and live OpenSky data. That makes it not just a model prototype, but a full applied ML and geospatial reconstruction workflow.
+
+\end{document}

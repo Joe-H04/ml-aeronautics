@@ -13,19 +13,17 @@ load_dotenv()
 
 
 class OpenSkyError(Exception):
-    """Base exception for OpenSky API integration errors."""
+    pass
 
 
 class OpenSkyHTTPError(OpenSkyError):
-    """HTTP-level OpenSky error with optional status code."""
-
     def __init__(self, message: str, status_code: Optional[int] = None):
         super().__init__(message)
         self.status_code = status_code
 
 
 class OpenSkyClient:
-    """Small OpenSky REST client with optional OAuth token caching."""
+    """OpenSky REST client with optional OAuth token caching."""
 
     BASE_URL = "https://opensky-network.org/api"
     TOKEN_URL = (
