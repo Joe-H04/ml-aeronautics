@@ -1,204 +1,216 @@
 import argparse
-import os
-import time
+import shutil
+import zlib
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Iterable
 
 import pandas as pd
-import requests
-from dotenv import load_dotenv
+from pyopensky.trino import Trino
 
-load_dotenv()
+DEFAULT_AIRPORTS = ["EDDF", "EGLL", "LFPG", "EHAM", "LEMD",
+                    "LIRF", "LOWW", "LSZH", "EKCH", "EDDM"]
+METADATA_COLS = ["icao24", "firstseen", "lastseen",
+                 "estdepartureairport", "estarrivalairport", "callsign"]
+TRACK_RENAME = {
+    "tp_time": "time",
+    "tp_lat": "latitude",
+    "tp_lon": "longitude",
+    "tp_alt": "baro_altitude",
+    "tp_heading": "true_track",
+    "tp_onground": "on_ground",
+}
+MAX_ALTITUDE_M = 15000
 
-BASE_URL = "https://opensky-network.org/api"
-TOKEN_URL = "https://auth.opensky-network.org/auth/realms/opensky-network/protocol/openid-connect/token"
-DEFAULT_AIRPORTS = ["EDDF", "EGLL", "LFPG", "EHAM", "LEMD", "LIRF", "LOWW", "LSZH", "EKCH", "EDDM"]
-FLIGHT_COLUMNS = [
-    "icao24", "firstSeen", "estDepartureAirport", "lastSeen", "estArrivalAirport", "callsign",
-    "estDepartureAirportHorizDistance", "estDepartureAirportVertDistance",
-    "estArrivalAirportHorizDistance", "estArrivalAirportVertDistance",
-    "departureAirportCandidatesCount", "arrivalAirportCandidatesCount",
-]
-TRACK_COLUMNS = ["time", "latitude", "longitude", "baro_altitude", "true_track", "on_ground"]
-TOKEN = {"value": None, "exp": 0.0}
-SESSION = requests.Session()
 
+# =============================================================================
+# 1. COMMAND LINE ARGUMENTS
+# Configures the script's execution parameters from the terminal, allowing the
+# user to set target airports, timeframes (days), output directories, and the
+# deterministic train/test split ratio without modifying the source code.
+# =============================================================================
 
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--airports", nargs="+", default=DEFAULT_AIRPORTS)
-    p.add_argument("--hours", type=int, default=4)
+    p.add_argument("--days", type=int, default=2)
     p.add_argument("--output", default="data/clean")
+    p.add_argument("--test-output", default="data/clean/test_tracks")
+    p.add_argument("--test-ratio", type=float, default=0.2)
+    p.add_argument("--clean", action="store_true")
     p.add_argument("--no-tracks", action="store_true")
     return p.parse_args()
 
 
-def auth_headers():
-    client_id = os.getenv("OPENSKY_CLIENT_ID")
-    client_secret = os.getenv("OPENSKY_CLIENT_SECRET")
-    if not client_id or not client_secret:
-        return {}
-    if time.time() >= TOKEN["exp"]:
-        r = requests.post(
-            TOKEN_URL,
-            data={
-                "grant_type": "client_credentials",
-                "client_id": client_id,
-                "client_secret": client_secret,
-            },
-            timeout=15,
+# =============================================================================
+# 2. INGESTION
+# Handles querying the OpenSky Trino database sequentially by day partitions.
+# It fetches flight metadata and uses UNNEST to explode the compressed, nested
+# trajectory arrays into individual, timestamped spatial waypoint rows.
+# =============================================================================
+
+def day_partitions(days: int) -> Iterable[int]:
+    today = datetime.now(timezone.utc).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    for i in range(days, 0, -1):
+        yield int((today - timedelta(days=i)).timestamp())
+
+
+def fetch_day(trino: Trino, day: int, airports: list[str]) -> pd.DataFrame:
+    airport_list = ",".join(f"'{a.upper()}'" for a in airports)
+    sql = f"""
+    SELECT f.icao24, f.firstseen, f.lastseen,
+           f.estdepartureairport, f.estarrivalairport, f.callsign,
+           tp_time, tp_lat, tp_lon, tp_alt, tp_heading, tp_onground
+    FROM flights_data4 f
+    CROSS JOIN UNNEST(f.track) AS t(
+        tp_time, tp_lat, tp_lon, tp_alt, tp_heading, tp_onground
+    )
+    WHERE f.day = {day}
+      AND (f.estdepartureairport IN ({airport_list})
+           OR f.estarrivalairport IN ({airport_list}))
+    """
+    return trino.query(sql)
+
+
+# =============================================================================
+# 3. CLEANING
+# Processes the raw trajectory data by sorting chronologically, removing duplicate
+# timestamps, dropping rows with missing spatial coordinates, and filtering out
+# ground-level taxiing data or erroneous altitude spikes.
+# =============================================================================
+
+def clean_track(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.sort_values("time").drop_duplicates("time")
+    df = df.dropna(subset=["latitude", "longitude", "baro_altitude"])
+    on_ground = df["on_ground"].astype("boolean").fillna(False)
+    return df[(df["baro_altitude"] < MAX_ALTITUDE_M) & (~on_ground)]
+
+
+# =============================================================================
+# 4. STORING
+# Deterministically routes flights into train or test datasets using a CRC32 hash
+# of the flight ID to prevent data leakage. Formats the data and writes the
+# trajectories and overall metadata to disk as highly-compressed Parquet files.
+# =============================================================================
+
+def assign_to_test(icao24: str, firstseen: int, ratio: float) -> bool:
+    if ratio <= 0:
+        return False
+    key = f"{icao24}|{int(firstseen)}".encode()
+    return (zlib.crc32(key) % 100) < int(ratio * 100)
+
+
+def write_tracks(raw: pd.DataFrame, train_dir: Path, test_dir: Path,
+                 test_ratio: float) -> tuple[int, int, int, int]:
+    train_dir.mkdir(parents=True, exist_ok=True)
+    if test_ratio > 0:
+        test_dir.mkdir(parents=True, exist_ok=True)
+    df = raw.rename(columns=TRACK_RENAME)
+
+    raw_total = clean_total = train_written = test_written = 0
+    for (icao24, first), group in df.groupby(["icao24", "firstseen"], sort=False):
+        raw_total += len(group)
+        clean = clean_track(group)
+        clean_total += len(clean)
+        if clean.empty:
+            continue
+
+        callsign = (group["callsign"].dropna().iloc[0]
+                    if group["callsign"].notna().any() else "")
+        clean = clean[["time", "latitude", "longitude", "baro_altitude",
+                       "true_track", "on_ground"]].copy()
+        clean["icao24"] = icao24
+        clean["callsign"] = str(callsign).strip()
+        clean["flight_start"] = int(first)
+        clean["flight_end"] = int(group["lastseen"].iloc[0])
+
+        target_dir = (test_dir
+                      if assign_to_test(icao24, int(first), test_ratio)
+                      else train_dir)
+        clean.to_parquet(
+            target_dir / f"{icao24}_{int(first)}.parquet", index=False
         )
-        r.raise_for_status()
-        data = r.json()
-        TOKEN["value"] = data["access_token"]
-        TOKEN["exp"] = time.time() + data.get("expires_in", 1800) - 60
-    return {"Authorization": f"Bearer {TOKEN['value']}"}
+        if target_dir is test_dir:
+            test_written += 1
+        else:
+            train_written += 1
+
+    return raw_total, clean_total, train_written, test_written
 
 
-def get(path, **params):
-    try:
-        r = SESSION.get(f"{BASE_URL}{path}", headers=auth_headers(), params=params, timeout=30)
-        
-        if r.status_code == 401 and TOKEN["value"]:
-            TOKEN["exp"] = 0
-            r = SESSION.get(f"{BASE_URL}{path}", headers=auth_headers(), params=params, timeout=30)
-            
-        if r.status_code in (404, 500, 502, 503, 504):
-            return None
-            
-        r.raise_for_status()
-        return r.json()
-        
-    except requests.exceptions.RequestException:
-        return None
-
-
-def windows(start, end, step=7200):
-    while start < end:
-        yield start, min(start + step, end)
-        start += step
-
-
-def collect_flights(airports, start, end, output_dir):
-    print(f"\n[PHASE 1] INGESTION: Fetching Flight Metadata...")
-    keep = {a.upper() for a in airports}
-    chunks = []
-    for begin, finish in windows(start, end):
-        data = get("/flights/all", begin=begin, end=finish)
-        df = pd.DataFrame(data or [], columns=FLIGHT_COLUMNS)
-        if df.empty:
-            continue
-        
-        arrivals = df[df["estArrivalAirport"].isin(keep)].copy()
-        if not arrivals.empty:
-            arrivals["airport"] = arrivals["estArrivalAirport"]
-            arrivals["direction"] = "arrivals"
-            chunks.append(arrivals)
-            
-        departures = df[df["estDepartureAirport"].isin(keep)].copy()
-        if not departures.empty:
-            departures["airport"] = departures["estDepartureAirport"]
-            departures["direction"] = "departures"
-            chunks.append(departures)
-
-    flights = pd.concat(chunks, ignore_index=True).drop_duplicates(
-        subset=["icao24", "firstSeen", "lastSeen", "airport", "direction"]
-    ) if chunks else pd.DataFrame()
-
-    if not flights.empty:
-        out = output_dir / "flights"
-        out.mkdir(parents=True, exist_ok=True)
-        flights.to_parquet(out / f"flights_{datetime.now():%Y%m%d_%H%M%S}.parquet", index=False)
-        print(f" -> Success: Fetched {len(flights)} flight records from OpenSky.")
-    return flights
-
-
-def clean_and_segment_track(df):
-    """
-    Trajectory Segmentation and Cleaning with detailed step-by-step logs.
-    """
-    if df.empty:
-        return df, 0
-
-    initial_count = len(df)
-
-    # 1. SEGMENTATION: Chronological Sequencing
-    df_clean = df.sort_values(by=["time"]).copy()
-
-    # 2. CLEANING: Duplicate Timestamp Filter
-    df_clean = df_clean.drop_duplicates(subset=["time"])
-
-    # 3. CLEANING: Invalid Coordinate/Altitude Filter
-    df_clean = df_clean.dropna(subset=["latitude", "longitude", "baro_altitude"])
-
-    # 4. CLEANING: Ground & Space Filter
-    df_clean = df_clean[(df_clean["baro_altitude"] < 15000) & (df_clean["on_ground"] == False)]
-
-    final_count = len(df_clean)
-    return df_clean, final_count
-
-
-def collect_tracks(flights, output_dir):
-    print(f"\n[PHASE 2] CLEANING: Processing Trajectories...")
-    out = output_dir / "tracks"
-    out.mkdir(parents=True, exist_ok=True)
-    
-    unique_flights = flights.drop_duplicates(subset=["icao24", "firstSeen", "lastSeen"])
-    total_flights = len(unique_flights)
-    
-    total_raw_points = 0
-    total_clean_points = 0
-    
-    for i, (_, row) in enumerate(unique_flights.iterrows(), 1):
-        icao24 = str(row["icao24"]).lower()
-        first_seen = int(row["firstSeen"])
-        
-        track_data = get("/tracks/all", icao24=icao24, time=first_seen) or {}
-        path_data = track_data.get("path")
-        
-        if not path_data:
-            continue
-            
-        raw_df = pd.DataFrame(path_data, columns=TRACK_COLUMNS)
-        raw_count = len(raw_df)
-        total_raw_points += raw_count
-        
-        clean_df, clean_count = clean_and_segment_track(raw_df)
-        total_clean_points += clean_count
-        
-        if not clean_df.empty:
-            clean_df["icao24"] = icao24
-            clean_df["callsign"] = track_data.get("callsign") or str(row.get("callsign") or "").strip()
-            clean_df["flight_start"] = track_data.get("startTime")
-            clean_df["flight_end"] = track_data.get("endTime")
-            clean_df.to_parquet(out / f"{icao24}_{first_seen}.parquet", index=False)
-            
-        # Log progress every 5 flights to keep the terminal clean but informative
-        if i % 5 == 0 or i == total_flights:
-            print(f" -> Progress: [{i}/{total_flights}] flights processed.")
-
-    print(f"\n[SUMMARY] Pipeline Results:")
-    print(f" -> Total Raw Points Ingested: {total_raw_points}")
-    print(f" -> Total Clean Points Retained: {total_clean_points}")
-    if total_raw_points > 0:
-        removal_rate = ((total_raw_points - total_clean_points) / total_raw_points) * 100
-        print(f" -> Noise Removal Rate: {removal_rate:.1f}%")
+def write_flights(flights: pd.DataFrame, out_dir: Path) -> Path:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path = out_dir / f"flights_{datetime.now():%Y%m%d_%H%M%S}.parquet"
+    flights.to_parquet(path, index=False)
+    return path
 
 
 def main():
     args = parse_args()
-    output_dir = Path(args.output)
-    
-    end = datetime.now(timezone.utc).replace(microsecond=0)
-    start = end - timedelta(hours=args.hours)
-    
-    flights = collect_flights(args.airports, int(start.timestamp()), int(end.timestamp()), output_dir)
-    
-    if not flights.empty and not args.no_tracks:
-        collect_tracks(flights, output_dir)
-        print(f"\nPipeline finished! Clean datasets are ready in: {output_dir}\n")
-    else:
-        print("No flights found for the selected time window.")
+    trino = Trino()
+    out_dir = Path(args.output)
+    train_dir = out_dir / "tracks"
+    test_dir = Path(args.test_output)
+    airports = [a.upper() for a in args.airports]
+
+    if args.clean:
+        for d in (train_dir, test_dir):
+            if d.exists():
+                print(f"[CLEAN] wiping {d}")
+                shutil.rmtree(d)
+
+    print(f"[PIPELINE] ingesting {args.days} day(s) for airports {airports}")
+    print(f"           train tracks -> {train_dir}")
+    print(f"           test  tracks -> {test_dir}  (ratio={args.test_ratio})")
+
+    flight_metas = []
+    total_raw = total_clean = total_train = total_test = 0
+
+    for day in day_partitions(args.days):
+        day_iso = datetime.fromtimestamp(day, tz=timezone.utc).date().isoformat()
+        print(f"\n[DAY {day_iso}] querying flights_data4 (day={day})")
+
+        df = fetch_day(trino, day, airports)
+        if df.empty:
+            print("  no flights returned")
+            continue
+
+        meta = (df[METADATA_COLS]
+                .drop_duplicates(["icao24", "firstseen", "lastseen"]))
+        flight_metas.append(meta)
+        print(f"  flights={len(meta)}  raw track points={len(df)}")
+
+        if not args.no_tracks:
+            raw, clean, n_train, n_test = write_tracks(
+                df, train_dir, test_dir, args.test_ratio
+            )
+            total_raw += raw
+            total_clean += clean
+            total_train += n_train
+            total_test += n_test
+            print(f"  wrote train={n_train}  test={n_test}  "
+                  f"({raw} -> {clean} points)")
+
+    if not flight_metas:
+        print("\nNo flights found across the selected days.")
+        return
+
+    all_meta = (pd.concat(flight_metas, ignore_index=True)
+                .drop_duplicates(["icao24", "firstseen", "lastseen"]))
+    flights_path = write_flights(all_meta, out_dir / "flights")
+
+    print("\n[SUMMARY]")
+    print(f"  unique flights:       {len(all_meta)}")
+    print(f"  train track files:    {total_train}")
+    print(f"  test  track files:    {total_test}")
+    print(f"  raw points:           {total_raw}")
+    print(f"  clean points:         {total_clean}")
+    if total_raw > 0:
+        rate = (total_raw - total_clean) / total_raw * 100
+        print(f"  noise removed:        {rate:.1f}%")
+    print(f"  flights metadata ->   {flights_path}")
 
 
 if __name__ == "__main__":
