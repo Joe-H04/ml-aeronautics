@@ -23,6 +23,7 @@ def load_track(path):
     df = pd.read_parquet(path).sort_values("time").reset_index(drop=True)
     df = df.dropna(subset=["latitude", "longitude", "baro_altitude"])
 
+    # Skip tracks that cannot supply full left context, gap, and right context.
     min_len = 2 * CONTEXT_LENGTH + GAP_LENGTH
     if len(df) < min_len:
         return None
@@ -48,6 +49,7 @@ def path_length_km(positions):
 
 
 def interpolate_baselines(p_before, p_after):
+    # Place the hidden points evenly between the two anchor points.
     fractions = np.linspace(
         1 / (GAP_LENGTH + 1),
         GAP_LENGTH / (GAP_LENGTH + 1),
@@ -71,6 +73,7 @@ def interpolate_baselines(p_before, p_after):
 
 
 def error_summary(truth, prediction):
+    # Compare pointwise geographic error, plus how much the full hidden path length shifts.
     errors = great_circle_km(
         truth[:, 0],
         truth[:, 1],
@@ -88,12 +91,14 @@ def error_summary(truth, prediction):
 def evaluate_window(model, path, positions, altitudes, times, start):
     window = 2 * CONTEXT_LENGTH + GAP_LENGTH
 
+    # Split one evaluation window into left context, hidden gap, and right context.
     before_slc = slice(start, start + CONTEXT_LENGTH)
     gap_slc = slice(start + CONTEXT_LENGTH, start + CONTEXT_LENGTH + GAP_LENGTH)
     after_slc = slice(start + CONTEXT_LENGTH + GAP_LENGTH, start + window)
 
     truth = positions[gap_slc]
 
+    # Predict the hidden segment with the trained LSTM.
     lstm_lat, lstm_lon, _ = model.predict_gap(
         positions[before_slc],
         altitudes[before_slc],
@@ -108,6 +113,7 @@ def evaluate_window(model, path, positions, altitudes, times, start):
     p_after = positions[start + CONTEXT_LENGTH + GAP_LENGTH]
     great_circle, linear = interpolate_baselines(p_before, p_after)
 
+    # Collect all per-method metrics into one CSV row.
     row = {
         "flight": path.stem,
         "start_index": int(start),
@@ -133,6 +139,7 @@ def main():
             "Run `python train_lstm.py` first."
         )
 
+    # Load the trained residual model once for the full evaluation sweep.
     print(f"Loading LSTM weights from {WEIGHTS_PATH}")
     model = LSTMTrajectoryModel.load(
         str(WEIGHTS_PATH),
@@ -150,6 +157,7 @@ def main():
     print(f"Found {len(track_files)} track files")
     print(f"Gap setup: {CONTEXT_LENGTH} before + {GAP_LENGTH} hidden + {CONTEXT_LENGTH} after")
 
+    # Sample a few random windows from each eligible held-out flight.
     for path in track_files:
         track = load_track(path)
         if track is None:
@@ -174,6 +182,7 @@ def main():
         print("No eligible windows found.")
         return
 
+    # Aggregate per-gap rows into the summary table shown in the report.
     results = pd.DataFrame(rows)
     methods = ["lstm", "great_circle", "linear"]
 
@@ -198,6 +207,7 @@ def main():
     for method in methods:
         print(f"  {method:<14} {int((wins == method).sum())} of {len(results)}")
 
+    # Report the headline gain against the strongest geometric baseline.
     baseline = results["great_circle_mean_error_km"].mean()
     lstm = results["lstm_mean_error_km"].mean()
     if baseline > 0:

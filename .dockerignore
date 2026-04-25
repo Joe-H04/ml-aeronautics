@@ -1,0 +1,38 @@
+# Large / irrelevant directories
+local_data/
+.venv/
+venv/
+__pycache__/
+**/__pycache__/
+.git/
+.github/
+.idea/
+.vscode/
+.claude/
+
+# Build + cache artefacts
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Results / archives not needed inside the image
+*.zip
+evaluation_results.csv
+phase6_emissions_results.csv
+
+# LaTeX sources
+main.tex
+*.aux
+*.log
+*.out
+
+# Docker meta
+Dockerfile
+.dockerignore
+docker-compose.yml
+
+# Secrets (compose injects .env at runtime)
+.env

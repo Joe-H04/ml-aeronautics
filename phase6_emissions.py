@@ -26,6 +26,7 @@ def load_track(path):
     df = pd.read_parquet(path).sort_values("time").reset_index(drop=True)
     df = df.dropna(subset=["latitude", "longitude", "baro_altitude"])
 
+    # Skip tracks that are too short to provide full context around one hidden gap.
     min_len = 2 * CONTEXT_LENGTH + GAP_LENGTH
     if len(df) < min_len:
         return None
@@ -55,6 +56,7 @@ def km_to_co2_kg(km):
 
 
 def interpolation_baselines(p_before, p_after):
+    # Generate the classical baselines over the same hidden timestamps.
     fractions = np.linspace(
         1 / (GAP_LENGTH + 1),
         GAP_LENGTH / (GAP_LENGTH + 1),
@@ -77,6 +79,7 @@ def interpolation_baselines(p_before, p_after):
 
 
 def replace_gap(full_positions, gap_slc, reconstruction):
+    # Swap the original hidden segment with a reconstructed version.
     reconstructed = full_positions.copy()
     reconstructed[gap_slc] = reconstruction
     return reconstructed
@@ -91,6 +94,7 @@ def evaluate_one_flight(model, path):
     window = 2 * CONTEXT_LENGTH + GAP_LENGTH
     start = (len(positions) - window) // 2
 
+    # Use one centred window per flight: left context, hidden gap, right context.
     before_slc = slice(start, start + CONTEXT_LENGTH)
     gap_slc = slice(start + CONTEXT_LENGTH, start + CONTEXT_LENGTH + GAP_LENGTH)
     after_slc = slice(start + CONTEXT_LENGTH + GAP_LENGTH, start + window)
@@ -99,6 +103,7 @@ def evaluate_one_flight(model, path):
     truth_gap_dist = path_length_km(truth_gap)
     truth_full_dist = path_length_km(positions)
 
+    # Predict the hidden segment with the trained LSTM.
     lstm_lat, lstm_lon, _ = model.predict_gap(
         positions[before_slc],
         altitudes[before_slc],
@@ -113,6 +118,7 @@ def evaluate_one_flight(model, path):
     p_after = positions[start + CONTEXT_LENGTH + GAP_LENGTH]
     great_circle_gap, linear_gap = interpolation_baselines(p_before, p_after)
 
+    # Start from the true gap and full-flight distance / CO2 references.
     row = {
         "flight": path.stem,
         "truth_gap_dist_km": truth_gap_dist,
@@ -121,6 +127,7 @@ def evaluate_one_flight(model, path):
         "truth_full_co2_kg": km_to_co2_kg(truth_full_dist),
     }
 
+    # Measure how each reconstruction shifts distance and emissions from truth.
     for method, gap_positions in [
         ("lstm", lstm_gap),
         ("great_circle", great_circle_gap),
@@ -146,6 +153,7 @@ def main():
             "Run `python train_lstm.py` first."
         )
 
+    # Load the trained model once, then reuse it across all flights.
     print(f"Loading LSTM weights from {WEIGHTS_PATH}")
     model = LSTMTrajectoryModel.load(
         str(WEIGHTS_PATH),
@@ -158,6 +166,7 @@ def main():
     print(f"Found {len(track_files)} track files")
     print(f"Emissions proxy: {CO2_KG_PER_KM:.2f} kg CO2 per km\n")
 
+    # Run the per-flight sensitivity analysis over all eligible tracks.
     for i, path in enumerate(track_files, 1):
         result = evaluate_one_flight(model, path)
         if result is None:
@@ -170,6 +179,7 @@ def main():
     if not rows:
         return
 
+    # Summarize average gap-level and full-flight distance / CO2 deviations.
     results = pd.DataFrame(rows)
 
     print("\n" + "=" * 76)

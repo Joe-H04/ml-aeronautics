@@ -1,9 +1,3 @@
-"""Ingest flight trajectories from the OpenSky Trino historical database.
-
-Read RULES.MD before changing this file — ignoring OpenSky's efficient-use
-guidelines gets the account banned.
-"""
-
 import argparse
 import shutil
 import zlib
@@ -29,23 +23,31 @@ TRACK_RENAME = {
 MAX_ALTITUDE_M = 15000
 
 
+# =============================================================================
+# 1. COMMAND LINE ARGUMENTS
+# Configures the script's execution parameters from the terminal, allowing the
+# user to set target airports, timeframes (days), output directories, and the
+# deterministic train/test split ratio without modifying the source code.
+# =============================================================================
+
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--airports", nargs="+", default=DEFAULT_AIRPORTS)
-    p.add_argument("--days", type=int, default=2,
-                   help="Number of past UTC days to ingest (excludes today)")
-    p.add_argument("--output", default="data/clean",
-                   help="Root for flights/, tracks/ (train)")
-    p.add_argument("--test-output", default="data/clean/test_tracks",
-                   help="Dir for held-out test flight parquets")
-    p.add_argument("--test-ratio", type=float, default=0.2,
-                   help="Fraction of flights routed to test dir "
-                        "(deterministic hash, 0 disables)")
-    p.add_argument("--clean", action="store_true",
-                   help="Wipe tracks/ and test-output dirs before writing")
+    p.add_argument("--days", type=int, default=2)
+    p.add_argument("--output", default="data/clean")
+    p.add_argument("--test-output", default="data/clean/test_tracks")
+    p.add_argument("--test-ratio", type=float, default=0.2)
+    p.add_argument("--clean", action="store_true")
     p.add_argument("--no-tracks", action="store_true")
     return p.parse_args()
 
+
+# =============================================================================
+# 2. INGESTION
+# Handles querying the OpenSky Trino database sequentially by day partitions.
+# It fetches flight metadata and uses UNNEST to explode the compressed, nested
+# trajectory arrays into individual, timestamped spatial waypoint rows.
+# =============================================================================
 
 def day_partitions(days: int) -> Iterable[int]:
     today = datetime.now(timezone.utc).replace(
@@ -72,12 +74,26 @@ def fetch_day(trino: Trino, day: int, airports: list[str]) -> pd.DataFrame:
     return trino.query(sql)
 
 
+# =============================================================================
+# 3. CLEANING
+# Processes the raw trajectory data by sorting chronologically, removing duplicate
+# timestamps, dropping rows with missing spatial coordinates, and filtering out
+# ground-level taxiing data or erroneous altitude spikes.
+# =============================================================================
+
 def clean_track(df: pd.DataFrame) -> pd.DataFrame:
     df = df.sort_values("time").drop_duplicates("time")
     df = df.dropna(subset=["latitude", "longitude", "baro_altitude"])
     on_ground = df["on_ground"].astype("boolean").fillna(False)
     return df[(df["baro_altitude"] < MAX_ALTITUDE_M) & (~on_ground)]
 
+
+# =============================================================================
+# 4. STORING
+# Deterministically routes flights into train or test datasets using a CRC32 hash
+# of the flight ID to prevent data leakage. Formats the data and writes the
+# trajectories and overall metadata to disk as highly-compressed Parquet files.
+# =============================================================================
 
 def assign_to_test(icao24: str, firstseen: int, ratio: float) -> bool:
     if ratio <= 0:

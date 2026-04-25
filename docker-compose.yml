@@ -1,0 +1,22 @@
+services:
+  api:
+    build: .
+    image: ml-aeronautics:latest
+    container_name: ml-aeronautics-api
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    restart: unless-stopped
+    # Optional: bind-mount tracks and weights so you can swap them
+    # without rebuilding the image. Comment these out to use the
+    # copies baked into the image.
+    volumes:
+      - ./data/clean/tracks:/app/data/clean/tracks:ro
+      - ./weights:/app/weights:ro
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 40s
